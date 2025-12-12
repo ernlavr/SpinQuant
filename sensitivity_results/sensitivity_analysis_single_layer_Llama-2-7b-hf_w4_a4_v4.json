@@ -1,0 +1,107 @@
+[
+    {
+        "layer_id": 0,
+        "perplexity": 5.724794387817383,
+        "inference_time_ms_per_token": 0.06386415355176811
+    },
+    {
+        "layer_id": 1,
+        "perplexity": 5.75576639175415,
+        "inference_time_ms_per_token": 0.06299662769558918
+    },
+    {
+        "layer_id": 2,
+        "perplexity": 5.734983921051025,
+        "inference_time_ms_per_token": 0.06317455797310335
+    },
+    {
+        "layer_id": 3,
+        "perplexity": 5.740009307861328,
+        "inference_time_ms_per_token": 0.06308783357401929
+    },
+    {
+        "layer_id": 4,
+        "perplexity": 5.72305965423584,
+        "inference_time_ms_per_token": 0.06299659681607442
+    },
+    {
+        "layer_id": 5,
+        "perplexity": 5.719419956207275,
+        "inference_time_ms_per_token": 0.06341687562953995
+    },
+    {
+        "layer_id": 6,
+        "perplexity": 5.720357418060303,
+        "inference_time_ms_per_token": 0.06283260361257806
+    },
+    {
+        "layer_id": 7,
+        "perplexity": 5.719090938568115,
+        "inference_time_ms_per_token": 0.06319577004536088
+    },
+    {
+        "layer_id": 8,
+        "perplexity": 5.705409526824951,
+        "inference_time_ms_per_token": 0.06317498956818178
+    },
+    {
+        "layer_id": 9,
+        "perplexity": 5.700135231018066,
+        "inference_time_ms_per_token": 0.06322079717394817
+    },
+    {
+        "layer_id": 10,
+        "perplexity": 5.705906867980957,
+        "inference_time_ms_per_token": 0.06314986656947308
+    },
+    {
+        "layer_id": 11,
+        "perplexity": 5.703902721405029,
+        "inference_time_ms_per_token": 0.0632720711719559
+    },
+    {
+        "layer_id": 12,
+        "perplexity": 5.71033239364624,
+        "inference_time_ms_per_token": 0.06301713061619954
+    },
+    {
+        "layer_id": 13,
+        "perplexity": 5.707329750061035,
+        "inference_time_ms_per_token": 0.06312042331121054
+    },
+    {
+        "layer_id": 14,
+        "perplexity": 5.7127685546875,
+        "inference_time_ms_per_token": 0.0633332108158663
+    },
+    {
+        "layer_id": 15,
+        "perplexity": 5.724181652069092,
+        "inference_time_ms_per_token": 0.0631947495851172
+    },
+    {
+        "layer_id": 16,
+        "perplexity": 5.7298712730407715,
+        "inference_time_ms_per_token": 0.06318046888673162
+    },
+    {
+        "layer_id": 17,
+        "perplexity": 5.729050159454346,
+        "inference_time_ms_per_token": 0.0633542638227164
+    },
+    {
+        "layer_id": 18,
+        "perplexity": 5.731573581695557,
+        "inference_time_ms_per_token": 0.06344950414565673
+    },
+    {
+        "layer_id": 19,
+        "perplexity": 5.729562759399414,
+        "inference_time_ms_per_token": 0.06305070275283721
+    },
+    {
+        "layer_id": 20,
+        "perplexity": 5.735629081726074,
+        "inference_time_ms_per_token": 0.06338464531553797
+    }
+]
