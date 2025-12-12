@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 from transformers import LlamaTokenizerFast
 import transformers
+from transformers import AutoModelForCausalLM
 from eval_utils.main import ptq_model
 from eval_utils.modeling_llama import LlamaForCausalLM
 from utils import data_utils, eval_utils, utils, quant_utils
