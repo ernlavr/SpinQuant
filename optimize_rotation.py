@@ -24,8 +24,17 @@ from utils.hadamard_utils import random_hadamard_matrix
 from utils.process_args import process_args_ptq
 from utils.utils import get_local_rank, get_logger, pt_fsdp_state_dict
 import time
-
+import wandb
+import random
+import os
+import sys
+    
+os.environ['WANDB_API_KEY'] = '49c8e7dca82f91f9d65021c3dd71101b686c1f53'
 log: Logger = get_logger("spinquant")
+
+
+import torch
+from torch.optim import Optimizer
 
 
 class RotateModule(nn.Module):
@@ -34,6 +43,8 @@ class RotateModule(nn.Module):
         self.weight = nn.Parameter(R_init.to(torch.float32).to(torch.device("cuda")))
 
     def forward(self, x, transpose=False):
+        # add noise to self.weight
+        print("forwarding rotator", flush=True)
         if transpose:
             return x @ self.weight
         else:
@@ -41,14 +52,16 @@ class RotateModule(nn.Module):
 
 
 def train() -> None:
-    dist.init_process_group(backend="nccl", timeout=datetime.timedelta(hours=8))
     model_args, training_args, ptq_args = process_args_ptq()
+    
+    
     local_rank = get_local_rank()
 
     log.info("the rank is {}".format(local_rank))
     torch.distributed.barrier()
 
     start_time = time.perf_counter()
+    
 
     config = transformers.AutoConfig.from_pretrained(
         model_args.input_model, token=model_args.access_token
@@ -109,7 +122,7 @@ def train() -> None:
         for i in range(model.config.num_hidden_layers)
     ]
     model.seqlen = training_args.model_max_length
-    optimizer = SGDG(trainable_parameters, lr=training_args.learning_rate, stiefel=True)
+    optimizer = SGDG(trainable_parameters, lr=training_args.learning_rate, stiefel=True, args=ptq_args)
     MyTrainer = Trainer
     # Use FSDP for 70B rotation training
     if training_args.fsdp != "" and training_args.fsdp != []:
@@ -153,6 +166,38 @@ def train() -> None:
         f"or {(end_time - start_time) / 60:.2f} minutes"
     )
 
+def main_sweep_func():
+    sweep_config = {
+        'method': 'grid',
+        'metric': {
+            'name': 'train/loss',
+            'goal': 'minimize'
+        },
+        'parameters': {
+            'noise_scalar': {
+                'values': [0.5, 0.2, 0.1, 0.05, 0.01, 0]
+            }
+        }
+    }
+    
+    sweep_id = wandb.sweep(sweep_config, project='spinquant-noise')
+    def sweep_train():
+        with wandb.init() as run:
+            config = wandb.config
+            # Here you can access config.noise_scalar and use it in your training
+            print(f"Running training with noise_scalar: {config.noise_scalar}")
+            train()
+    wandb.agent(sweep_id, function=sweep_train)
+
+def main():
+    dist.init_process_group(backend="nccl", timeout=datetime.timedelta(hours=8))
+    
+    if "--wandb_sweep" in sys.argv:
+        main_sweep_func()
+    else:
+        train()
+    dist.destroy_process_group()
+    
 
 if __name__ == "__main__":
-    train()
+    main()

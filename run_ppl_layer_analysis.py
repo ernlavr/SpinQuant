@@ -15,12 +15,15 @@ from eval_utils.main import ptq_model
 from eval_utils.modeling_llama import LlamaForCausalLM
 from utils import data_utils, eval_utils, utils, quant_utils
 from utils.process_args import process_args_ptq
+import wandb
+import sys
+os.environ['WANDB_API_KEY'] = '49c8e7dca82f91f9d65021c3dd71101b686c1f53'
+
 
 def main():
     # --- Setup ---
     # We start by parsing arguments just like in ptq.py
     # We'll override the 'exclude_activations_layers' argument in our loop
-    dist.init_process_group(backend="nccl", timeout=datetime.timedelta(hours=8))
     model_args, training_args, ptq_args = process_args_ptq()
     local_rank = utils.get_local_rank()
 
@@ -53,7 +56,7 @@ def main():
     print("="*80)
 
     # --- Main Analysis Loop ---
-    for i in range(total_layers):
+    for i in range(0, total_layers, 6):
         print(f"\n[INFO] Running analysis for layer {i} (quantizing ONLY this layer's activations)")
 
         # --- Dynamically set the layers to exclude ---
@@ -106,6 +109,7 @@ def main():
         )
 
         ppl, avg_time_per_token = eval_utils.evaluator(model, testloader, utils.DEV, ptq_args)
+        wandb.log({"perplexity": ppl, "layer_id": i, "seed": ptq_args.seed})
         
         dist.barrier()
 
@@ -127,5 +131,40 @@ def main():
     print("Sensitivity analysis complete.")
     print(f"Final results have been saved to: {results_file}")
 
+def pre_main_sweep_func():
+    sweep_config = {
+        'method': 'grid',
+        'metric': {
+            'name': 'perplexity',
+            'goal': 'minimize'
+        },
+        'parameters': {
+            'seed': {
+                'values': [int(42), int(13), int(0)]
+            },
+            'noise_scalar': {
+                'values': [1, 0.5, 0.2, 0.1, 0.05, 0.01, 0]
+            }
+        }
+    }
+    
+    sweep_id = wandb.sweep(sweep_config, project='spinquant-noise')
+    def sweep_main():
+        with wandb.init() as run:
+            config = wandb.config
+            # Here you can access config.noise_scalar and use it in your training
+            print(f"Running training with noise_scalar: {config.noise_scalar}")
+            main()
+    wandb.agent(sweep_id, function=sweep_main)
+
+def pre_main():
+    dist.init_process_group(backend="nccl", timeout=datetime.timedelta(hours=8))
+    
+    if "--wandb_sweep" in sys.argv:
+        pre_main_sweep_func()
+    else:
+        main()
+    dist.destroy_process_group()
+
 if __name__ == "__main__":
-    main()
+    pre_main()

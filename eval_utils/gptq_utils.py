@@ -231,6 +231,10 @@ def gptq_fwrd(model, dataloader, dev, args, custom_layers=None):
         ["mlp.up_proj.module", "mlp.gate_proj.module"],
         ["mlp.down_proj.module"],
     ]
+    
+    # get early, mid and late layers
+    
+    
     for i in range(len(layers)):
         print(f"\nLayer {i}:", flush=True, end=" ")
         layer = layers[i].to(dev)

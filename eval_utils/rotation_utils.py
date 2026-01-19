@@ -45,6 +45,53 @@ def random_orthogonal_matrix(size, device):
     q *= torch.sign(torch.diag(r)).unsqueeze(0)
     return q
 
+def perturb_rotation_matrix(R_original, noise_scale, device, args):
+    """
+    Applies a small random rotation 'noise' to an original rotation matrix.
+    
+    Args:
+        R_original (torch.Tensor): The base rotation matrix (size x size).
+        noise_scale (float): Magnitude of the noise (standard deviation of the angle).
+    
+    Returns:
+        torch.Tensor: Perturbed rotation matrix.
+    """
+    cache_dir = "output_dir/precomputed_noises"
+    size = R_original.shape[0]
+    
+    # 1. Generate random matrix, forward declare
+    A = None
+    
+    # check if output_dir/precomputed_noises/ contains entry for size_size_seed
+    pt_file = f"{cache_dir}/{size}_{size}_seed-{args.seed}.pt"
+    if os.path.exists(pt_file):
+        A = torch.load(pt_file)
+        print(f"INFO: Loaded precomputed random matrix from {os.path.abspath(pt_file)}")
+    else:
+        A = torch.randn(size, size, dtype=R_original.dtype, device=device)
+        os.makedirs(cache_dir, exist_ok=True)
+        torch.save(A, pt_file)
+        print(f"INFO: Saved precomputed random matrix to {os.path.abspath(pt_file)}") 
+    
+    
+    # 2. Create skew-symmetric matrix (Lie Algebra element)
+    # Dividing by sqrt(2) ensures the elements have unit variance before scaling
+    skew = (A - A.T) / torch.sqrt(torch.tensor(2.0)) 
+    
+    # 3. Apply scale
+    skew *= noise_scale
+    
+    # 4. Exponentiate to get the rotation noise
+    # matrix_exp maps the skew-symmetric matrix to SO(n)
+    R_noise = torch.linalg.matrix_exp(skew)
+    
+    # 5. Compose with original rotation
+    # Note: Order matters. R_noise @ R_original perturbs in the global frame.
+    # R_original @ R_noise perturbs in the local frame. 
+    # For isotropic noise, they are statistically equivalent.
+    R_perturbed = R_noise @ R_original
+    
+    return R_perturbed
 
 def get_orthogonal_matrix(size, mode, device="cuda"):
     if mode == "random":
@@ -166,6 +213,13 @@ def rotate_model(model, args):
         R_cpk = args.optimized_rotation_path
         print(f"INFO (rotate_model): Found optimized rotation path: {R_cpk}")
         R1 = torch.load(R_cpk)["R1"].cuda().to(torch.float64)
+        
+        if args.noise_scalar is not None:
+            R1 = perturb_rotation_matrix(R1, noise_scale=args.noise_scalar, device="cuda", args=args)
+        
+    # add random gaussian noise to R1
+    # gaussian = (torch.randn_like(R1) * R1.std() + R1.mean()) * 0.1
+    
     config = model.config
     num_heads = config.num_attention_heads
     model_dim = config.hidden_size
@@ -181,6 +235,10 @@ def rotate_model(model, args):
             R2 = torch.load(R_cpk)[key].cuda().to(torch.float64)
         else:
             R2 = get_orthogonal_matrix(head_dim, args.rotate_mode)
+        # adding noise
+        if args.noise_scalar is not None:
+            R2 = perturb_rotation_matrix(R2, noise_scale=args.noise_scalar, device="cuda", args=args)
+        # end noise
         rotate_attention_inputs(layers[idx], R1)
         rotate_attention_output(layers[idx], R1)
         rotate_mlp_input(layers[idx], R1)

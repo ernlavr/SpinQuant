@@ -13,7 +13,7 @@ from typing import Optional, Tuple
 
 import argparse
 import transformers
-
+import wandb
 
 @dataclass
 class ModelArguments:
@@ -27,7 +27,7 @@ class ModelArguments:
         default=None, metadata={"help": "Optimized rotation checkpoint path"}
     )
     access_token: Optional[str] = field(
-        default=None,
+        default="49c8e7dca82f91f9d65021c3dd71101b686c1f53",
         metadata={"help": "Huggingface access token to access gated repo like Llama"},
     )
 
@@ -45,6 +45,7 @@ class TrainingArguments(transformers.TrainingArguments):
 
 
 def parser_gen():
+    """ Implement all args here which are NOT 1:1 part of ModelArguments or TrainingArguments """
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
@@ -128,6 +129,7 @@ def parser_gen():
         default=False,
         help="Apply Hadamard rotation in FP32 (default: False)",
     )
+    
 
     # Activation Quantization Arguments
     parser.add_argument(
@@ -350,6 +352,18 @@ def parser_gen():
         default="wikitext2",
         help="The dataset to use for evaluation. Options: 'wikitext2', 'c4'."
     )
+    parser.add_argument(
+        "--noise_scalar",
+        type=float,
+        default=0,
+        help="Noise scaling factor",
+    )
+    parser.add_argument(
+        "--wandb_sweep",
+        action="store_true",
+        help="Run this as a Weights and Bias sweep",
+        default=False,
+    )
 
     args, unknown = parser.parse_known_args()
 
@@ -370,11 +384,40 @@ def parser_gen():
 
     return args, unknown
 
+def parse_wandb_sweep(ptq_args, unknown_args: dict):
+    if ptq_args.wandb_sweep is False:
+        return ptq_args, unknown_args
+
+    # Overwrite where possible, what's left add to ptq_args
+    wandb_args = wandb.config.as_dict()
+    overwritten_keys = []
+    for key, value in wandb_args.items():
+        if hasattr(ptq_args, key):
+            setattr(ptq_args, key, wandb_args[key])
+            print(f"Updated {key} from wandb config: {value}")
+            overwritten_keys.append(key)
+            continue
+        
+        # hacky for unknown args...
+        if "--" + key in unknown_args:
+            i = unknown_args.index("--" + key) + 1
+            unknown_args[i] = str(wandb_args[key])
+            print(f"Updated {key} in unknown args from wandb config: {value}")
+            overwritten_keys.append(key)
+            continue
+    
+    # remove overwritten keys, add the rest to ptq_args
+    [wandb_args.pop(k) for k in overwritten_keys]
+    [setattr(ptq_args, k, v) for k, v in wandb_args.items()]
+    
+    return ptq_args, unknown_args
+
 
 def process_args_ptq():
-    ptq_args = None
+    ptq_args = None 
 
     ptq_args, unknown_args = parser_gen()
+    ptq_args, unknown_args = parse_wandb_sweep(ptq_args, unknown_args)
 
     parser = transformers.HfArgumentParser((ModelArguments, TrainingArguments))
     model_args, training_args = parser.parse_args_into_dataclasses(args=unknown_args)
@@ -385,5 +428,7 @@ def process_args_ptq():
     else:
         ptq_args.optimized_rotation_path = None
     ptq_args.bsz = training_args.per_device_eval_batch_size
+    
+    # parse config if WandB sweep
 
     return model_args, training_args, ptq_args

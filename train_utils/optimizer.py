@@ -11,6 +11,7 @@ import random
 
 import torch
 from torch.optim.optimizer import Optimizer
+import wandb
 
 
 def unit(v, dim: int = 1, eps: float = 1e-8):
@@ -94,6 +95,7 @@ class SGDG(Optimizer):
         stiefel: bool = False,
         omega: int = 0,
         grad_clip=None,
+        args=None,
     ) -> None:
         defaults = dict(
             lr=lr,
@@ -104,7 +106,10 @@ class SGDG(Optimizer):
             stiefel=stiefel,
             omega=0,
             grad_clip=grad_clip,
+            noise_scalar=None if 'noise_scalar' not in args else args.noise_scalar,
         )
+        
+        self.args = args
         if nesterov and (momentum <= 0 or dampening != 0):
             raise ValueError("Nesterov momentum requires a momentum and zero dampening")
         super(SGDG, self).__init__(params, defaults)
@@ -121,6 +126,7 @@ class SGDG(Optimizer):
             closure (callable, optional): A closure that reevaluates the model
                 and returns the loss.
         """
+        print("optimizer steppering", flush=True)
         loss = None
         if closure is not None:
             loss = closure()
@@ -144,6 +150,12 @@ class SGDG(Optimizer):
                         unity = qr_retraction(unity)
 
                     g = p.grad.data.view(p.size()[0], -1)
+                    # insert noise here
+                    if g.shape[0] > 128: # skips attention heads.. very hacky
+                        n_alpha = torch.sqrt(torch.tensor(group['lr'])) * group['noise_scalar']
+                        noise = torch.randn_like(g) * n_alpha
+                        g = g + noise
+                    # end of noise insertion
 
                     lr = group["lr"]
 
