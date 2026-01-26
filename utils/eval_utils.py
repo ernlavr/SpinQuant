@@ -8,6 +8,7 @@
 # This code is based on QuaRot(https://github.com/spcl/QuaRot/tree/main/quarot).
 # Licensed under Apache License 2.0.
 
+from copy import deepcopy
 import logging
 import os
 import json
@@ -198,12 +199,7 @@ def evaluator(model, testenc, dev, args):
 
         dtype = next(iter(model.parameters())).dtype
         # The input of the first decoder layer.
-        inps = torch.zeros(
-            (nbatches, batch_size, model.seqlen, model.config.hidden_size),
-            dtype=dtype,
-            device=dev,
-        )
-        inps = [0] * nbatches
+        inps = [None] * nbatches
         cache = {"i": 0, "attention_mask": None}
 
         class Catcher(torch.nn.Module):
@@ -231,10 +227,12 @@ def evaluator(model, testenc, dev, args):
 
         model.model.embed_tokens = model.model.embed_tokens.cpu()
         position_ids = cache["position_ids"]
-
+        attention_mask = cache["attention_mask"]
+        
+        cache.clear()
         torch.cuda.empty_cache()
         outs = [0] * nbatches
-        attention_mask = cache["attention_mask"]
+        
 
         # --- Timing Initialization ---
         total_layer_processing_time_ms = 0.0
@@ -261,17 +259,18 @@ def evaluator(model, testenc, dev, args):
                 logging.info(f"Dumped layer input and output to: {save_path}")
 
             for j in range(nbatches):
-                outs[j] = layer(
+                tmp = layer(
                     inps[j],
                     attention_mask=attention_mask,
                     #  defined.
                     position_ids=position_ids,
                 )[0]
+                outs[j] = tmp
             layers[i] = layer.cpu()
+            
             del layer
-            torch.cuda.empty_cache()
             inps, outs = outs, inps
-        
+            
         end_event_layer_loop.record()
         torch.cuda.synchronize()
         end_cpu_layer = time.perf_counter()
@@ -300,9 +299,12 @@ def evaluator(model, testenc, dev, args):
             shift_logits = lm_logits[:, :-1, :]
             shift_labels = input_ids[i][:, 1:]
             loss = loss_fct(shift_logits.permute(0, 2, 1), shift_labels)
-            neg_log_likelihood = loss.float().mean(dim=1)
+            neg_log_likelihood = loss.float().mean(dim=1).detach().cpu()
             nlls.append(neg_log_likelihood)
+            
         
+        del inps, outs
+        torch.cuda.empty_cache()
         end_event_head_loop.record()
         torch.cuda.synchronize()
         end_cpu_head = time.perf_counter()
@@ -335,6 +337,8 @@ def evaluator(model, testenc, dev, args):
         else:
             print("No tokens processed, cannot calculate time per token.")
         # --- End Timing Report ---
+
+
     avg_total_inference_time = sum(list_total_inference_time) / len(list_total_inference_time)
     var_total_inference_time = sum(
         [(x - avg_total_inference_time) ** 2 for x in list_total_inference_time]
