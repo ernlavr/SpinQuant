@@ -364,6 +364,18 @@ def parser_gen():
         help="Run this as a Weights and Bias sweep",
         default=False,
     )
+    parser.add_argument(
+        "--wandb_run",
+        action="store_true",
+        help="Run this as a Weights and Bias run",
+        default=False,
+    )
+    parser.add_argument(
+        "--use_sensitivity_cache",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use cached sensitivity results if available",
+    )
 
     args, unknown = parser.parse_known_args()
 
