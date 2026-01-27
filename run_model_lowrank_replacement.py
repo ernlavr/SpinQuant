@@ -1,71 +1,18 @@
+import os
+import sys
 import torch
 import torch.nn as nn
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from typing import Tuple, Optional
 import math
+from utils import low_rank_utils as lru
 
 from utils import data_utils, eval_utils, utils
 from utils.process_args import process_args_ptq
-
-
-class LowRankLinear(nn.Module):
-    """
-    Replaces nn.Linear with a low-rank decomposition: W ≈ L @ R
-    where L: (in_features, rank) and R: (rank, out_features)
-    
-    Supports both inference and training (e.g., for student-teacher training).
-    """
-    def __init__(self, in_features: int, out_features: int, rank: int, 
-                 bias: bool = True, device=None, dtype=None):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.rank = rank
-        
-        # Low-rank factors
-        self.L = nn.Parameter(torch.empty(in_features, rank, device=device, dtype=dtype))
-        self.R = nn.Parameter(torch.empty(rank, out_features, device=device, dtype=dtype))
-        
-        # Optional bias (usually present in transformer models)
-        if bias:
-            self.bias = nn.Parameter(torch.empty(out_features, device=device, dtype=dtype))
-        else:
-            self.register_parameter('bias', None)
-        
-        self._reset_parameters()
-    
-    def _reset_parameters(self):
-        """Initialize with proper scaling for training stability"""
-        # Initialize L and R with Xavier-like initialization scaled by rank
-        # This helps maintain activation scales during training
-        fan_in = self.in_features
-        fan_out = self.out_features
-        
-        # Scale initialization by 1/sqrt(rank) to keep output variance stable
-        scale_L = math.sqrt(2.0 / (fan_in + self.rank))
-        scale_R = math.sqrt(2.0 / (self.rank + fan_out))
-        
-        nn.init.normal_(self.L, std=scale_L)
-        nn.init.normal_(self.R, std=scale_R)
-        
-        if self.bias is not None:
-            nn.init.zeros_(self.bias)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Compute: x @ L @ R + bias
-        # More efficient: x @ (L @ R) computed as (x @ L) @ R
-        x_proj = torch.matmul(x, self.L)  # (..., rank)
-        output = torch.matmul(x_proj, self.R)  # (..., out_features)
-        
-        if self.bias is not None:
-            output = output + self.bias
-        
-        return output
-    
-    def extra_repr(self) -> str:
-        return (f'in_features={self.in_features}, out_features={self.out_features}, '
-                f'rank={self.rank}, bias={self.bias is not None}')
+from modules.linears import LowRankLinear
+import utils.wandb_utils as wandb_utils
+from dotenv import load_dotenv
 
 
 def decompose_weight(weight: torch.Tensor, rank: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -212,9 +159,31 @@ def get_compression_stats(model: nn.Module) -> dict:
         'lowrank_params': lowrank_params,
     }
 
-
-# Example usage for student-teacher training
-if __name__ == "__main__":
+def perform_binary_search_truncation(model, sensitivity_dict, calib_loader, args):
+    return lru.binary_search_truncation_rank(model, sensitivity_dict, calib_loader, args)
+    
+def test_calib_sensitivity_ppl(model, training_args, model_args, ptq_args):
+    tokenizer = AutoTokenizer.from_pretrained(
+            pretrained_model_name_or_path=model_args.input_model,
+            cache_dir=training_args.cache_dir,
+            model_max_length=training_args.model_max_length,
+            padding_side="right",
+            use_fast=True,
+            add_eos_token=False,
+            add_bos_token=False,
+            token=model_args.access_token,
+        )
+    
+    testloader = data_utils.get_wikitext2(
+            seed=ptq_args.seed,
+            seqlen=2048,
+            tokenizer=tokenizer,
+            eval_mode=True,
+        )
+    
+    return lru.calib_sensitivity_ppl(model, testloader, ptq_args, use_cache=ptq_args.use_sensitivity_cache)
+    
+def process():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model_args, training_args, ptq_args = process_args_ptq()
     print("Loading teacher model...")
@@ -224,75 +193,97 @@ if __name__ == "__main__":
     #     device_map="auto"
     # )
     # teacher_model.eval()
-    
-    for rank_modifier in [1, 0.75, 0.5, 0.25, 0.1]:
         
-        print("Loading student model (will be compressed)...")
-        student_model = AutoModelForCausalLM.from_pretrained(
-            "meta-llama/Llama-3.1-8B",
-            torch_dtype=torch.float32,
-            device_map="auto",
+    rank_modifier = 0.25
+    print("Loading student model (will be compressed)...")
+    student_model = AutoModelForCausalLM.from_pretrained(
+        "meta-llama/Llama-3.1-8B",
+        torch_dtype=torch.float32,
+        device_map="auto",
+        token=model_args.access_token,
+    )
+    student_model.seqlen = training_args.model_max_length
+    uncompressed_stats = get_compression_stats(student_model)
+    print(f"Compressing student with rank={rank_modifier}...")
+    
+    # tokenizer, data loader
+    tokenizer = AutoTokenizer.from_pretrained(
+            pretrained_model_name_or_path=model_args.input_model,
+            cache_dir=training_args.cache_dir,
+            model_max_length=training_args.model_max_length,
+            padding_side="right",
+            use_fast=True,
+            add_eos_token=False,
+            add_bos_token=False,
             token=model_args.access_token,
         )
-        student_model.seqlen = training_args.model_max_length
-        uncompressed_stats = get_compression_stats(student_model)
-        
-        rank = rank_modifier
-        print(f"Compressing student with rank={rank}...")
-        
-        # First, see what Linear modules are available
-        print("\nAvailable Linear modules:")
-        all_linear_modules = get_all_linear_module_names(student_model)
-        for name in all_linear_modules[:10]:  # Show first 10
-            print(f"  - {name}")
-        if len(all_linear_modules) > 10:
-            print(f"  ... and {len(all_linear_modules) - 10} more")
-        
-        # Option 1: Replace all Linear layers
-        # replace_linear_with_lowrank(student_model, rank=rank, init_with_svd=True)
-        
-        # Option 2: Replace specific modules (recommended for LLMs)
-        layer_id = 16
-        target_modules = [i for i in all_linear_modules if f"model.layers.{layer_id}." in i]
-        
-        replace_linear_with_lowrank(
-            student_model, 
-            rank_modifier=rank_modifier,
-            target_modules=target_modules,
-            init_with_svd=True
+    
+    testloader = data_utils.get_wikitext2(
+            seed=ptq_args.seed,
+            seqlen=2048,
+            tokenizer=tokenizer,
+            eval_mode=True,
         )
+    
+    # test sensitivity from ASVD paper
+    sensitivity = test_calib_sensitivity_ppl(student_model, training_args, model_args, ptq_args)
+    
+    if sensitivity is not None:
+        perform_binary_search_truncation(student_model, sensitivity, testloader, ptq_args)
         
-        student_model.train()
-        
-        # Print compression stats
-        compressed_stats = get_compression_stats(student_model)
-        print(f"\nCompression Statistics:")
-        print(f"  Total parameters original: {uncompressed_stats['total_params']:,}")
-        print(f"  Total parameters decomposed: {compressed_stats['total_params']:,}")
-        print(f"  Low-rank parameters: {compressed_stats['lowrank_params']:,}")
-        compression_ratio = compressed_stats['total_params'] / uncompressed_stats['total_params']
-        print(f"  Compression ratio: {compression_ratio:.2%}")
-        
-        tokenizer = AutoTokenizer.from_pretrained(
-                pretrained_model_name_or_path=model_args.input_model,
-                cache_dir=training_args.cache_dir,
-                model_max_length=training_args.model_max_length,
-                padding_side="right",
-                use_fast=True,
-                add_eos_token=False,
-                add_bos_token=False,
-                token=model_args.access_token,
-            )
-        
-        testloader = data_utils.get_wikitext2(
-                seed=ptq_args.seed,
-                seqlen=2048,
-                tokenizer=tokenizer,
-                eval_mode=True,
-            )
+    
+    # First, see what Linear modules are available
+    print("\nAvailable Linear modules:")
+    all_linear_modules = get_all_linear_module_names(student_model)
+    for name in all_linear_modules[:10]:  # Show first 10
+        print(f"  - {name}")
+    if len(all_linear_modules) > 10:
+        print(f"  ... and {len(all_linear_modules) - 10} more")
+    
+    
+    # Defines which modules to replace
+    layer_id = list(range(0, 32))
+    target_modules = [i for i in all_linear_modules for j in layer_id if f"model.layers.{j}." in i]
+    
+    # Do the replacement
+    replace_linear_with_lowrank(
+        student_model, 
+        rank_modifier=rank_modifier,
+        target_modules=target_modules,
+        init_with_svd=True
+    )
+    
+    student_model.train()
+    
+    # Print compression stats
+    compressed_stats = get_compression_stats(student_model)
+    print(f"\nCompression Statistics:")
+    print(f"  Total parameters original: {uncompressed_stats['total_params']:,}")
+    print(f"  Total parameters decomposed: {compressed_stats['total_params']:,}")
+    print(f"  Low-rank parameters: {compressed_stats['lowrank_params']:,}")
+    compression_ratio = compressed_stats['total_params'] / uncompressed_stats['total_params']
+    print(f"  Compression ratio: {compression_ratio:.2%}")
+    
+    tokenizer = AutoTokenizer.from_pretrained(
+            pretrained_model_name_or_path=model_args.input_model,
+            cache_dir=training_args.cache_dir,
+            model_max_length=training_args.model_max_length,
+            padding_side="right",
+            use_fast=True,
+            add_eos_token=False,
+            add_bos_token=False,
+            token=model_args.access_token,
+        )
+    
+    testloader = data_utils.get_wikitext2(
+            seed=ptq_args.seed,
+            seqlen=2048,
+            tokenizer=tokenizer,
+            eval_mode=True,
+        )
 
-        ppl, avg_time_per_token = eval_utils.evaluator(student_model, testloader, utils.DEV, ptq_args)
-        print(f"[SUCCESS] Layer {layer_id}, Rank {rank}: Wiki2 PPL = {ppl:.2f}, Time = {avg_time_per_token:.4f} ms/token")
+    ppl, avg_time_per_token = eval_utils.evaluator(student_model, testloader, utils.DEV, ptq_args)
+    print(f"[SUCCESS] Layer {layer_id}: Wiki2 PPL = {ppl:.2f}, Time = {avg_time_per_token:.4f} ms/token")
     
     # # Example training setup
     # print("\nSetting up training...")
@@ -323,3 +314,19 @@ if __name__ == "__main__":
     # optimizer.step()
     
     print("Training step completed successfully!")
+
+def main():
+    # dist.init_process_group(backend="nccl", timeout=datetime.timedelta(hours=8))
+    load_dotenv('.env')
+    if "--wandb_sweep" in sys.argv:
+        wandb_utils.start_sweep(None, process)
+    elif "--wandb_run" in sys.argv:
+        wandb_utils.start_run("lowrank_replacement_test", None, process)
+    else:
+        process()
+    # dist.destroy_process_group()
+
+# Example usage for student-teacher training
+if __name__ == "__main__":
+    main()
+    
