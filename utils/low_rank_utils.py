@@ -1,15 +1,17 @@
-import torch
+import random
 from typing import Tuple
 import os
 import json
 
 import functools
 import math
+import torch
+import time
 
 import torch
-import tqdm
+from tqdm import tqdm
 
-from utils import monkeypatch, quant_utils, utils
+from utils import eval_utils, monkeypatch, quant_utils, utils
 from utils.hadamard_utils import (
     apply_exact_had_to_linear,
     is_pow2,
@@ -17,6 +19,7 @@ from utils.hadamard_utils import (
 )
 from utils.utils import HadamardTransform
 import matplotlib.pyplot as plt
+from modules.linears import SVDLinear, LowRankLinear
 OUTPUT_DIR = "output_dir/low_rank_analysis/singular_values"
 
 def plot_series(data_series, title, xlabel, ylabel, output_name):
@@ -33,6 +36,8 @@ def plot_series(data_series, title, xlabel, ylabel, output_name):
     plt.grid(True)
     plt.savefig(os.path.join(OUTPUT_DIR, output_name))
     plt.close()
+    
+
 
 def perform_svd_decomp(matrix: torch.Tensor, rank: int = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -59,8 +64,6 @@ def perform_svd_decomp(matrix: torch.Tensor, rank: int = None) -> Tuple[torch.Te
     S = S.to(device="cpu", dtype=torch.float64)
     Vh = Vh.to(device="cpu", dtype=torch.float64)
     return U, S, Vh
-
-
 
 
 def decompose_embeddings(model) -> None:
@@ -138,6 +141,249 @@ def decompose_ov_proj(layer, head_num, head_dim, R2=None):
     apply_exact_had_to_linear(o_proj, had_dim=head_dim, output=False, R2=R2)
 
 
+@torch.no_grad()
+def calib_sensitivity_ppl(model, calib_loader, args, use_cache=True):
+    model_id = model.config._name_or_path
+    cache_dir = '/eos/home-e/elavrino/git/SpinQuant/output_dir/low_rank_analysis/cache'
+    cache_file = f"{cache_dir}/{model_id.replace('/','_')}_calib_sensitivity_ppl.pt"
+    os.makedirs(cache_dir, exist_ok=True)
+    if os.path.exists(cache_file) and use_cache:
+        sensitivity_dict = torch.load(cache_file, map_location="cpu")
+        return sensitivity_dict
+    model.eval()
+
+    full_name_dict = {module: name for name, module in model.named_modules()}
+    linear_info = {}
+    modules = [model]
+    while len(modules) > 0:
+        submodule = modules.pop()
+        for name, raw_linear in submodule.named_children():
+            if isinstance(raw_linear, torch.nn.Linear):
+                full_name = full_name_dict[raw_linear]
+                linear_info[raw_linear] = {
+                    "father": submodule,
+                    "name": name,
+                    "full_name": full_name,
+                }
+            else:
+                modules.append(raw_linear)
+
+    sensitivity_dict = {}
+    if False: # args.compress_kv_cache
+        param_ratio_candidates = [0.1 * i for i in range(1, 20)]
+    else:
+        param_ratio_candidates = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    
+    # compute baseline ppl
+    # ppl, avg_time_per_token = eval_utils.evaluator(model, calib_loader, utils.DEV, args)
+    sensitivity_dict["baseline"] = ppl    
+    
+    # input_ids = torch.cat([_["input_ids"] for _ in calib_loader], 0)
+    # print(f"input_ids.shape={input_ids.shape}")
+    pbar = tqdm(total=len(linear_info) * len(param_ratio_candidates))
+    for raw_linear, info in linear_info.items():
+        sensitivity_dict[info["full_name"]] = {}
+        for param_ratio in param_ratio_candidates:
+            torch.cuda.empty_cache()
+            svd_linear = SVDLinear.from_linear(
+                raw_linear,
+                param_ratio=param_ratio,
+                act_aware=False,
+            )
+            setattr(info["father"], info["name"], svd_linear)
+            ppl, avg_time_per_token = eval_utils.evaluator(model, calib_loader, utils.DEV, args)            
+            sensitivity_dict[info["full_name"]][param_ratio] = ppl
+            print(f"Processed Layer: {info['full_name']}; Param Ratio: {param_ratio}; PPL: {ppl}")
+            print(f"Saving sensitivity results to: {cache_file}")
+            torch.save(sensitivity_dict, cache_file)
+            pbar.update(1)
+            
+        setattr(info["father"], info["name"], raw_linear)
+        
+    print(f"Saved sensitivity results to {cache_file}")
+    torch.save(sensitivity_dict, cache_file)
+    
+    return sensitivity_dict
+
+def binary_search_truncation_rank(model, sensitivity_dict, calib_loader, args):
+    """
+    Binary search over truncation ranks to find optimal compression of model layers.
+    
+    Compresses either weight parameters or KV cache based on args.compress_kv_cache.
+    Uses binary search to find compression ratios that satisfy either a perplexity
+    target (ppl_target) or a parameter ratio target (ratio_target).
+    
+    Args:
+        model: PyTorch model to compress
+        sensitivity_dict: Dictionary mapping layer names to sensitivity metrics
+        calib_loader: DataLoader for calibration samples
+        args: Configuration object with compression parameters
+        
+    From: https://github.dev/hahnyuan/ASVD4LLM/blob/main/binary_search.py
+    """
+    # Build dictionaries for efficient module lookup    
+    module_dict = {name: module for name, module in model.named_modules()}
+    full_name_dict = {module: name for name, module in model.named_modules()}
+    linear_info = {}
+    sensitivity_dict.pop("baseline", None)
+    
+    # DEBUG: Set args
+    args.compress_kv_cache = False
+    args.ppl_target = 0
+    args.param_ratio_target = 0.5
+    
+    # Recursively find all Linear modules in the model
+    modules = [model]
+    while len(modules) > 0:
+        submodule = modules.pop()
+        for name, raw_linear in submodule.named_children():
+            if isinstance(raw_linear, torch.nn.Linear):
+                full_name = full_name_dict[raw_linear]
+
+                linear_info[raw_linear] = {
+                    "father": submodule,
+                    "name": name,
+                    "full_name": full_name,
+                }
+            else:
+                modules.append(raw_linear)
+
+    # Set compression target and filtering based on mode
+    if args.compress_kv_cache:
+        ratio_target = args.kv_cache_ratio_target
+        # Filter sensitivity dict to only KV cache projections
+        sensitivity_dict = {
+            k: v for k, v in sensitivity_dict.items() 
+            if "k_proj" in k or "v_proj" in k
+        }
+        assert args.ppl_target < 0, "ppl_target is not supported when compressing kv_cache"
+        default_param_ratio = 2
+    else:
+        ratio_target = args.param_ratio_target
+        default_param_ratio = 1
+
+    print(
+        f"=== {'compress kv_cache' if args.compress_kv_cache else 'compress weight'} target: ppl={args.ppl_target}, ratio_target={ratio_target} ==="
+    )
+
+    # Build sorted list of (layer_name, param_ratio, ppl) tuples
+    sensitivity_list = []
+    for layername, v in sensitivity_dict.items():
+        for param_ratio, ppl in v.items():
+            if not args.compress_kv_cache and param_ratio >= 1:
+                # we need to compress the weights, so parameter ratio should be less than 1
+                continue
+            sensitivity_list.append((layername, param_ratio, ppl))
+    
+    # Sort by perplexity (descending) - higher PPL = more sensitive layers
+    sorted_sensitive_list = sorted(sensitivity_list, key=lambda x: -x[2])
+
+    # Validate that at least one target is specified
+    assert args.ppl_target > 0 or ratio_target > 0
+    
+    # binary search
+    high = len(sorted_sensitive_list) - 1
+    low = 0
+    while low < high:
+        mid = (low + high) // 2
+        
+        # Initialize all layers with default ratio, then apply compression to sensitive ones
+        layers_min_ratio = {layername: default_param_ratio for layername in sensitivity_dict.keys()}
+        for layername, param_ratio, ppl in sorted_sensitive_list[mid:]:
+            layers_min_ratio[layername] = min(layers_min_ratio[layername], param_ratio)
+        
+        # Compute total and compressed parameters
+        tot_params = 0
+        compress_params = 0
+        if args.ppl_target > 0:
+            # Search based on perplexity target
+            assert not args.compress_kv_cache, "ppl_target is not supported when compressing kv_cache now"
+            
+            # Apply SVD decomposition with current ratios
+            for layername, param_ratio in layers_min_ratio.items():
+                raw_linear = module_dict[layername]
+                info = linear_info[raw_linear]
+                svd_linear = SVDLinear.from_linear(
+                    raw_linear,
+                    param_ratio=param_ratio,
+                    alpha=args.alpha,
+                    act_aware=args.act_aware,
+                    sigma_fuse=args.sigma_fuse,
+                    rank_align=args.rank_align,
+                )
+                setattr(info["father"], info["name"], svd_linear)
+                tot_params += raw_linear.weight.numel()
+                compress_params += raw_linear.weight.numel() * param_ratio
+            
+            # Eval perplexity
+            ppl = eval_utils.evaluator(model, calib_loader, utils.DEV, args)
+            param_ratio = compress_params / tot_params
+            msg = f"low={low} mid={mid}, high={high}, ppl={ppl}, param_ratio={param_ratio}"
+            print(msg)
+            
+            # Adjust search range based on perplexity
+            if ppl < args.ppl_target:
+                high = mid
+            else:
+                low = mid + 1
+        else:
+            # Search based on parameter ratio target
+            for layername, param_ratio in layers_min_ratio.items():
+                raw_linear = module_dict[layername]
+                tot_params += raw_linear.weight.numel()
+                compress_params += raw_linear.weight.numel() * param_ratio
+            now_ratio = compress_params / tot_params
+            
+            if args.compress_kv_cache:
+                # because param ratio is the params for ALinear+BLienar, so the rank ratio is param ratio/2
+                now_ratio /= 2
+                
+            msg = f"low={low} mid={mid}, high={high}, now_ratio={now_ratio}, params=({compress_params}/{tot_params})"
+            print(msg)
+            
+            # Adjust search range based on parameter ratio
+            if now_ratio > ratio_target:
+                high = mid
+            else:
+                low = mid + 1
+
+    print(f"=== Searching done, decomposing layers... ===")
+    
+    # Final decomposition with optimal ratios
+    layers_min_ratio = {layername: default_param_ratio for layername in sensitivity_dict.keys()}
+    for layername, param_ratio, ppl in sorted_sensitive_list[mid:]:
+        if layers_min_ratio[layername] is None:
+            layers_min_ratio[layername] = param_ratio
+        else:
+            layers_min_ratio[layername] = min(layers_min_ratio[layername], param_ratio)
+    
+    # Apply SVD decomposition to all layers
+    st = time.time()
+    for layername, param_ratio in tqdm(layers_min_ratio.items()):
+        # set ratio
+        raw_linear = module_dict[layername]
+        info = linear_info[raw_linear]
+        
+        # Skip decomposition if using default ratio (no compression)
+        if param_ratio == default_param_ratio:
+            svd_linear = raw_linear
+        else:
+            svd_linear = SVDLinear.from_linear(
+                raw_linear,
+                param_ratio=param_ratio,
+                alpha=args.alpha,
+                act_aware=args.act_aware,
+                sigma_fuse=args.sigma_fuse,
+                rank_align=args.rank_align,
+            )
+            raw_linear.to("cpu")
+        
+        # Replace original linear layer with SVD version
+        setattr(info["father"], info["name"], svd_linear)
+
+    ed = time.time()
+    print(f"decompose time: {ed-st}")
+
 @torch.inference_mode()
 def decompose_model(model, args):
     selective_had_layers = None
@@ -160,95 +406,3 @@ def decompose_model(model, args):
         #decompose_mlp_output(layers[idx], R1, args)
         # decompose_mlp_output(layers[idx], idx)
         # decompose_ov_proj(layers[idx], num_heads, head_dim)
-
-class QKRotationWrapper(torch.nn.Module):
-    def __init__(self, func, config, *args, **kwargs):
-        super().__init__()
-        self.config = config
-        num_heads = config.num_attention_heads
-        model_dim = config.hidden_size
-        head_dim = model_dim // num_heads
-        assert is_pow2(
-            head_dim
-        ), f"Only power of 2 head_dim is supported for K-cache Quantization!"
-        self.func = func
-        self.k_quantizer = quant_utils.ActQuantizer()
-        self.k_bits = 16
-        # Pop the new argument to control rotation, defaulting to False
-        self.apply_rotation = kwargs.pop("apply_rotation", False)
-        if kwargs is not None:
-            assert kwargs["k_groupsize"] in [
-                -1,
-                head_dim,
-            ], f"Only token-wise/{head_dim}g quantization is supported for K-cache"
-            self.k_bits = kwargs["k_bits"]
-            self.k_groupsize = kwargs["k_groupsize"]
-            self.k_sym = kwargs["k_sym"]
-            self.k_clip_ratio = kwargs["k_clip_ratio"]
-            self.k_quantizer.configure(
-                bits=self.k_bits,
-                groupsize=-1,  # we put -1 to be toke-wise quantization and handle head-wise quantization by ourself
-                sym=self.k_sym,
-                clip_ratio=self.k_clip_ratio,
-            )
-
-    def forward(self, *args, **kwargs):
-        q, k = self.func(*args, **kwargs)
-
-        # If no quantization or rotation is needed, return immediately
-        if self.k_bits >= 16 and not self.apply_rotation:
-            return q, k
-        
-        dtype = q.dtype
-        
-        # R3 rotation
-        if self.apply_rotation:
-            q = (HadamardTransform.apply(q.float()) / math.sqrt(q.shape[-1])).to(dtype)
-            k = (HadamardTransform.apply(k.float()) / math.sqrt(k.shape[-1])).to(dtype)
-            
-        (bsz, num_heads, seq_len, head_dim) = k.shape
-
-        if self.k_bits < 16:
-            if self.k_groupsize == -1:  # token-wise quantization
-                token_wise_k = k.transpose(1, 2).reshape(-1, num_heads * head_dim)
-                self.k_quantizer.find_params(token_wise_k)
-                k = (
-                    self.k_quantizer(token_wise_k)
-                    .reshape((bsz, seq_len, num_heads, head_dim))
-                    .transpose(1, 2)
-                    .to(q)
-                )
-            else:  # head-wise quantization
-                per_head_k = k.reshape(-1, head_dim)
-                self.k_quantizer.find_params(per_head_k)
-                k = (
-                    self.k_quantizer(per_head_k)
-                    .reshape((bsz, num_heads, seq_len, head_dim))
-                    .to(q)
-                )
-
-            self.k_quantizer.free()
-
-        return q, k
-
-
-def add_qk_rotation_wrapper_after_function_call_in_forward(
-    module,
-    function_name,
-    *args,
-    **kwargs,
-):
-    """
-    This function adds a rotation wrapper after the output of a function call in forward.
-    Only calls directly in the forward function are affected. calls by other functions called in forward are not affected.
-    """
-
-    attr_name = f"{function_name}_qk_rotation_wrapper"
-    assert not hasattr(module, attr_name)
-    wrapper = monkeypatch.add_wrapper_after_function_call_in_method(
-        module,
-        "forward",
-        function_name,
-        functools.partial(QKRotationWrapper, *args, **kwargs),
-    )
-    setattr(module, attr_name, wrapper)
