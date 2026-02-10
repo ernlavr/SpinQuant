@@ -2,10 +2,15 @@ import os
 import sys
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+import datetime
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from typing import Tuple, Optional
 import math
+
+import wandb
+from train_utils.knowledge_distillation import DistillationConfig, KnowledgeDistiller
 from utils import low_rank_utils as lru
 
 from utils import data_utils, eval_utils, utils
@@ -13,6 +18,8 @@ from utils.process_args import process_args_ptq
 from modules.linears import LowRankLinear
 import utils.wandb_utils as wandb_utils
 from dotenv import load_dotenv
+
+# 
 
 
 def decompose_weight(weight: torch.Tensor, rank: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -186,15 +193,10 @@ def test_calib_sensitivity_ppl(model, training_args, model_args, ptq_args):
 def process():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model_args, training_args, ptq_args = process_args_ptq()
+    utils.set_random_seeds(seed=ptq_args.seed)
     print("Loading teacher model...")
-    # teacher_model = AutoModelForCausalLM.from_pretrained(
-    #     "meta-llama/Llama-2-7b-hf",
-    #     torch_dtype=torch.float16,
-    #     device_map="auto"
-    # )
-    # teacher_model.eval()
-        
-    rank_modifier = 0.25
+
+
     print("Loading student model (will be compressed)...")
     student_model = AutoModelForCausalLM.from_pretrained(
         "meta-llama/Llama-3.1-8B",
@@ -204,7 +206,7 @@ def process():
     )
     student_model.seqlen = training_args.model_max_length
     uncompressed_stats = get_compression_stats(student_model)
-    print(f"Compressing student with rank={rank_modifier}...")
+    print(f"Compressing student with param ratio target={ptq_args.param_ratio_target}...")
     
     # tokenizer, data loader
     tokenizer = AutoTokenizer.from_pretrained(
@@ -224,38 +226,18 @@ def process():
             tokenizer=tokenizer,
             eval_mode=True,
         )
+    uncompressed_ppl, avg_time_per_token = eval_utils.evaluator(student_model, testloader, utils.DEV, ptq_args) 
+    wandb.log({
+        "baseline/uncompressed_ppl": uncompressed_ppl,
+        "baseline/avg_time_per_token": avg_time_per_token,
+    })
     
-    # test sensitivity from ASVD paper
     sensitivity = test_calib_sensitivity_ppl(student_model, training_args, model_args, ptq_args)
     
     if sensitivity is not None:
-        perform_binary_search_truncation(student_model, sensitivity, testloader, ptq_args)
+        perform_binary_search_truncation(student_model, sensitivity, testloader, ptq_args)       
         
-    
-    # First, see what Linear modules are available
-    print("\nAvailable Linear modules:")
-    all_linear_modules = get_all_linear_module_names(student_model)
-    for name in all_linear_modules[:10]:  # Show first 10
-        print(f"  - {name}")
-    if len(all_linear_modules) > 10:
-        print(f"  ... and {len(all_linear_modules) - 10} more")
-    
-    
-    # Defines which modules to replace
-    layer_id = list(range(0, 32))
-    target_modules = [i for i in all_linear_modules for j in layer_id if f"model.layers.{j}." in i]
-    
-    # Do the replacement
-    replace_linear_with_lowrank(
-        student_model, 
-        rank_modifier=rank_modifier,
-        target_modules=target_modules,
-        init_with_svd=True
-    )
-    
-    student_model.train()
-    
-    # Print compression stats
+     # Print compression stats
     compressed_stats = get_compression_stats(student_model)
     print(f"\nCompression Statistics:")
     print(f"  Total parameters original: {uncompressed_stats['total_params']:,}")
@@ -263,6 +245,43 @@ def process():
     print(f"  Low-rank parameters: {compressed_stats['lowrank_params']:,}")
     compression_ratio = compressed_stats['total_params'] / uncompressed_stats['total_params']
     print(f"  Compression ratio: {compression_ratio:.2%}")
+    
+    # # eval
+    # compressed_ppl, avg_time_per_token = eval_utils.evaluator(student_model, testloader, utils.DEV, ptq_args) 
+    # print(f"Student model PPL after low-rank replacement: {compressed_ppl:.2f}, Avg time per token: {avg_time_per_token*1000:.2f} ms")
+    # wandb.log({
+    #     "baseline/uncompressed_ppl": uncompressed_ppl,
+    #     "baseline/compressed_ppl": compressed_ppl,
+    #     "baseline/compression_ratio": compression_ratio
+    # })
+    
+    # First, see what Linear modules are available
+    # print("\nAvailable Linear modules:")
+    # all_linear_modules = get_all_linear_module_names(student_model)
+    # for name in all_linear_modules[:10]:  # Show first 10
+    #     print(f"  - {name}")
+    # if len(all_linear_modules) > 10:
+    #     print(f"  ... and {len(all_linear_modules) - 10} more")
+    
+    # # Defines which modules to replace
+    # layer_id = list(range(0, 32))
+    # target_modules = [i for i in all_linear_modules for j in layer_id if f"model.layers.{j}." in i]
+    
+    # # Do the replacement
+    # replace_linear_with_lowrank(
+    #     student_model, 
+    #     rank_modifier=rank_modifier,
+    #     target_modules=target_modules,
+    #     init_with_svd=True
+    # )
+    
+   
+    
+    teacher_model = AutoModelForCausalLM.from_pretrained(
+        "meta-llama/Llama-3.1-8B",
+        device_map="auto",
+        token=model_args.access_token,
+    )
     
     tokenizer = AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path=model_args.input_model,
@@ -274,57 +293,50 @@ def process():
             add_bos_token=False,
             token=model_args.access_token,
         )
-    
-    testloader = data_utils.get_wikitext2(
+    test_loader = data_utils.get_wikitext2(
             seed=ptq_args.seed,
-            seqlen=2048,
+            seqlen=256,
             tokenizer=tokenizer,
             eval_mode=True,
         )
+    train_loader = data_utils.get_wikitext2(
+            seed=ptq_args.seed,
+            nsamples=ptq_args.train_loader_nsamples,
+            seqlen=ptq_args.train_loader_seqlen,
+            tokenizer=tokenizer,
+            eval_mode=False,
+        )
+    
+    # Knowledge Distillation Training
+    config = DistillationConfig(
+        temperature=1.0,
+        alpha=0.7,
+        batch_size=4,
+        learning_rate=1e-6,
+        num_epochs=5,
+        max_seq_length=256,
+    )
+    
+    # Initialize distiller
+    print(f"Using distillation: {ptq_args.use_distillation}")
+    distiller = KnowledgeDistiller(student_model, teacher_model, tokenizer, config)
+    distiller.train(train_loader, test_loader, ptq_args)
+    distiller.save_student_model("./distilled_llama_student")
 
-    ppl, avg_time_per_token = eval_utils.evaluator(student_model, testloader, utils.DEV, ptq_args)
-    print(f"[SUCCESS] Layer {layer_id}: Wiki2 PPL = {ppl:.2f}, Time = {avg_time_per_token:.4f} ms/token")
-    
-    # # Example training setup
-    # print("\nSetting up training...")
-    # optimizer = torch.optim.AdamW(student_model.parameters(), lr=1e-4)
-    
-    # # Example batch
-    # tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
-    # texts = ["The meaning of life is", "Artificial intelligence is"]
-    # inputs = tokenizer(texts, return_tensors="pt", padding=True).to(device)
-    
-    # print("Running forward pass...")
-    # with torch.no_grad():
-    #     teacher_outputs = teacher_model(**inputs, output_hidden_states=True)
-    
-    # student_outputs = student_model(**inputs, output_hidden_states=True)
-    
-    # # Simple MSE loss on hidden states (example distillation loss)
-    # loss = torch.nn.functional.mse_loss(
-    #     student_outputs.hidden_states[-1],
-    #     teacher_outputs.hidden_states[-1]
-    # )
-    
-    # print(f"Loss: {loss.item():.4f}")
-    
-    # print("Running backward pass...")
-    # optimizer.zero_grad()
-    # loss.backward()
-    # optimizer.step()
-    
-    print("Training step completed successfully!")
 
 def main():
-    # dist.init_process_group(backend="nccl", timeout=datetime.timedelta(hours=8))
+    dist.init_process_group(backend="nccl", timeout=datetime.timedelta(hours=8))
+    print(sys.argv)
     load_dotenv('.env')
     if "--wandb_sweep" in sys.argv:
-        wandb_utils.start_sweep(None, process)
+        # wandb_sweep is a parameter which has path to sweep config json file
+        config_path = sys.argv[sys.argv.index("--wandb_sweep") + 1]
+        wandb_utils.start_sweep(config_path, process)
     elif "--wandb_run" in sys.argv:
         wandb_utils.start_run("lowrank_replacement_test", None, process)
     else:
         process()
-    # dist.destroy_process_group()
+    dist.destroy_process_group()
 
 # Example usage for student-teacher training
 if __name__ == "__main__":
