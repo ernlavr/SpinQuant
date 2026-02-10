@@ -10,14 +10,24 @@
 
 import random
 from typing import Any, Dict
-
+from torch.utils.data.distributed import DistributedSampler
 import datasets
 import torch
 import transformers
 import os
 
+class TupleDataset(torch.utils.data.Dataset):
+    def __init__(self, data):
+        self.data = data
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        return self.data[idx]
+    
 
-def get_wikitext2(nsamples=128, seed=0, seqlen=2048, model="", tokenizer=None, eval_mode=False):
+def get_wikitext2(nsamples=128, seed=0, seqlen=2048, model="", tokenizer=None, eval_mode=False, bs=4):
     if tokenizer is None:
         tokenizer = transformers.AutoTokenizer.from_pretrained(model, use_fast=False)
 
@@ -41,6 +51,13 @@ def get_wikitext2(nsamples=128, seed=0, seqlen=2048, model="", tokenizer=None, e
             tar = inp.clone()
             tar[:, :-1] = -100
             trainloader.append((inp, tar))
+            
+        # create a dataloader
+        trainloader = torch.utils.data.DataLoader(
+            TupleDataset(trainloader), 
+            batch_size=4, 
+            shuffle=True,
+        )
         return trainloader
 
 def get_c4(nsamples=128, seed=0, seqlen=2048, model="", tokenizer=None, eval_mode=False):
