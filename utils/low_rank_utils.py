@@ -142,14 +142,16 @@ def decompose_ov_proj(layer, head_num, head_dim, R2=None):
 
 
 @torch.no_grad()
-def calib_sensitivity_ppl(model, calib_loader, args, use_cache=True):
+def calib_sensitivity_ppl(model, calib_loader, args, use_cache=None):
     model_id = model.config._name_or_path
     cache_dir = '/eos/home-e/elavrino/git/SpinQuant/output_dir/low_rank_analysis/cache'
-    cache_file = f"{cache_dir}/{model_id.replace('/','_')}_calib_sensitivity_ppl.pt"
+    cache_file = f"{cache_dir}/{model_id.replace('/','_')}_calib_sensitivity_ppl_backup.pt"
     os.makedirs(cache_dir, exist_ok=True)
-    if os.path.exists(cache_file) and use_cache:
-        sensitivity_dict = torch.load(cache_file, map_location="cpu")
+    if use_cache is not None and os.path.exists(use_cache):
+        sensitivity_dict = torch.load(use_cache, map_location="cpu")
+        print(f"Loaded sensitivity results from cache: {use_cache}")
         return sensitivity_dict
+    
     model.eval()
 
     full_name_dict = {module: name for name, module in model.named_modules()}
@@ -175,7 +177,7 @@ def calib_sensitivity_ppl(model, calib_loader, args, use_cache=True):
         param_ratio_candidates = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
     
     # compute baseline ppl
-    # ppl, avg_time_per_token = eval_utils.evaluator(model, calib_loader, utils.DEV, args)
+    ppl, avg_time_per_token = eval_utils.evaluator(model, calib_loader, utils.DEV, args)
     sensitivity_dict["baseline"] = ppl    
     
     # input_ids = torch.cat([_["input_ids"] for _ in calib_loader], 0)
@@ -230,7 +232,8 @@ def binary_search_truncation_rank(model, sensitivity_dict, calib_loader, args):
     # DEBUG: Set args
     args.compress_kv_cache = False
     args.ppl_target = 0
-    args.param_ratio_target = 0.5
+    print(f"Performing binary search truncation with param ratio target {args.param_ratio_target}")
+    
     
     # Recursively find all Linear modules in the model
     modules = [model]
@@ -371,10 +374,10 @@ def binary_search_truncation_rank(model, sensitivity_dict, calib_loader, args):
             svd_linear = SVDLinear.from_linear(
                 raw_linear,
                 param_ratio=param_ratio,
-                alpha=args.alpha,
-                act_aware=args.act_aware,
-                sigma_fuse=args.sigma_fuse,
-                rank_align=args.rank_align,
+                # alpha=args.alpha,
+                # act_aware=args.act_aware,
+                # sigma_fuse=args.sigma_fuse,
+                # rank_align=args.rank_align,
             )
             raw_linear.to("cpu")
         
@@ -406,3 +409,45 @@ def decompose_model(model, args):
         #decompose_mlp_output(layers[idx], R1, args)
         # decompose_mlp_output(layers[idx], idx)
         # decompose_ov_proj(layers[idx], num_heads, head_dim)
+        
+import numpy as np
+
+
+def effective_rank_participation(y, eps=1e-12):
+    """
+    Effective rank / participation ratio.
+    
+    Parameters
+    ----------
+    y : array-like, shape (n,)
+        Non-negative values (e.g., singular values or eigenvalues).
+    eps : float
+        Small constant for numerical stability.
+    
+    Returns
+    -------
+    r_eff : float
+        Effective rank.
+    """
+    y = np.asarray(y, dtype=float)
+    y = np.maximum(y, 0.0)
+
+    numerator = np.sum(y) ** 2
+    denominator = np.sum(y ** 2) + eps
+    return numerator / denominator
+
+
+def effective_rank_entropy(y, eps=1e-12):
+    """
+    Entropy-based effective rank.
+    
+    Returns exp(H), where H is Shannon entropy.
+    """
+    y = np.asarray(y, dtype=float)
+    y = np.maximum(y, 0.0)
+
+    p = y / (np.sum(y) + eps)
+    p = np.maximum(p, eps)
+
+    H = -np.sum(p * np.log(p))
+    return np.exp(H)
