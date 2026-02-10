@@ -360,9 +360,9 @@ def parser_gen():
     )
     parser.add_argument(
         "--wandb_sweep",
-        action="store_true",
-        help="Run this as a Weights and Bias sweep",
-        default=False,
+        type=str,
+        help="Specify a sweep config file to run this as a Weights and Biases sweep",
+        default=None,
     )
     parser.add_argument(
         "--wandb_run",
@@ -372,9 +372,45 @@ def parser_gen():
     )
     parser.add_argument(
         "--use_sensitivity_cache",
-        action=argparse.BooleanOptionalAction,
+        type=str,
         default=False,
-        help="Use cached sensitivity results if available",
+        help="Path to sensitivity cache file",
+    )
+    parser.add_argument(
+        "--train_loader_nsamples",
+        type=int,
+        default=4096,
+        help="Number of samples for the training data loader",
+    )
+    parser.add_argument(
+        "--train_loader_seqlen",
+        type=int,
+        default=512,
+        help="Sequence length for the training data loader",
+    )
+    parser.add_argument(
+        "--param_ratio_target",
+        type=float,
+        default=1.0,
+        help="Target parameter count ratio for mixed-precision quantization, 0-1",
+    )
+    parser.add_argument(
+        "--use_alternating_LR_training",
+        action="store_true",
+        help="Use alternating low-rank component training during knowledge distillation",
+        default=False,
+    )
+    parser.add_argument(
+        "--train_per_layer",
+        action="store_true",
+        help="Train the model gradually, layer-by-layer",
+        default=False,
+    )
+    parser.add_argument(
+        "--use_distillation",
+        action="store_true",
+        help="Use knowledge distillation during quantization",
+        default=False,
     )
 
     args, unknown = parser.parse_known_args()
@@ -429,7 +465,8 @@ def process_args_ptq():
     ptq_args = None 
 
     ptq_args, unknown_args = parser_gen()
-    ptq_args, unknown_args = parse_wandb_sweep(ptq_args, unknown_args)
+    if wandb.run is not None:
+        ptq_args, unknown_args = parse_wandb_sweep(ptq_args, unknown_args)
 
     parser = transformers.HfArgumentParser((ModelArguments, TrainingArguments))
     model_args, training_args = parser.parse_args_into_dataclasses(args=unknown_args)
