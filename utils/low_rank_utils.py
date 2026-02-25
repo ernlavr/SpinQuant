@@ -19,7 +19,7 @@ from utils.hadamard_utils import (
 )
 from utils.utils import HadamardTransform
 import matplotlib.pyplot as plt
-from modules.linears import SVDLinear, LowRankLinear
+from modules.linears import SVDLinear, SVDLinear_Smoothed
 OUTPUT_DIR = "output_dir/low_rank_analysis/singular_values"
 
 def plot_series(data_series, title, xlabel, ylabel, output_name):
@@ -145,7 +145,7 @@ def decompose_ov_proj(layer, head_num, head_dim, R2=None):
 def calib_sensitivity_ppl(model, calib_loader, args, use_cache=None):
     model_id = model.config._name_or_path
     cache_dir = '/eos/home-e/elavrino/git/SpinQuant/output_dir/low_rank_analysis/cache'
-    cache_file = f"{cache_dir}/{model_id.replace('/','_')}_calib_sensitivity_ppl_backup.pt"
+    cache_file = f"{cache_dir}/{model_id.replace('/','_')}_calib_sensitivity_ppl.pt"
     os.makedirs(cache_dir, exist_ok=True)
     if use_cache is not None and os.path.exists(use_cache):
         sensitivity_dict = torch.load(use_cache, map_location="cpu")
@@ -177,7 +177,7 @@ def calib_sensitivity_ppl(model, calib_loader, args, use_cache=None):
         param_ratio_candidates = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
     
     # compute baseline ppl
-    ppl, avg_time_per_token = eval_utils.evaluator(model, calib_loader, utils.DEV, args)
+    ppl, avg_time_per_token = eval_utils.evaluator_single_gpu_simplified(model, calib_loader, utils.DEV, args)
     sensitivity_dict["baseline"] = ppl    
     
     # input_ids = torch.cat([_["input_ids"] for _ in calib_loader], 0)
@@ -193,7 +193,7 @@ def calib_sensitivity_ppl(model, calib_loader, args, use_cache=None):
                 act_aware=False,
             )
             setattr(info["father"], info["name"], svd_linear)
-            ppl, avg_time_per_token = eval_utils.evaluator(model, calib_loader, utils.DEV, args)            
+            ppl, avg_time_per_token = eval_utils.evaluator_single_gpu_simplified(model, calib_loader, utils.DEV, args)            
             sensitivity_dict[info["full_name"]][param_ratio] = ppl
             print(f"Processed Layer: {info['full_name']}; Param Ratio: {param_ratio}; PPL: {ppl}")
             print(f"Saving sensitivity results to: {cache_file}")
@@ -359,27 +359,44 @@ def binary_search_truncation_rank(model, sensitivity_dict, calib_loader, args):
             layers_min_ratio[layername] = param_ratio
         else:
             layers_min_ratio[layername] = min(layers_min_ratio[layername], param_ratio)
-    
+            
     # Apply SVD decomposition to all layers
+    if args.train_low_rank_smoothing:
+        activations = extract_all_layer_activations(
+                        model, calib_loader, list(layers_min_ratio.keys()), max_batches=1
+                    )
+        
+        
     st = time.time()
     for layername, param_ratio in tqdm(layers_min_ratio.items()):
         # set ratio
         raw_linear = module_dict[layername]
         info = linear_info[raw_linear]
+        layer_is_square = raw_linear.weight.shape[0] == raw_linear.weight.shape[1]
         
         # Skip decomposition if using default ratio (no compression)
         if param_ratio == default_param_ratio:
             svd_linear = raw_linear
         else:
-            svd_linear = SVDLinear.from_linear(
-                raw_linear,
-                param_ratio=param_ratio,
-                # alpha=args.alpha,
-                # act_aware=args.act_aware,
-                # sigma_fuse=args.sigma_fuse,
-                # rank_align=args.rank_align,
-            )
-            raw_linear.to("cpu")
+            if args.train_low_rank_smoothing and layer_is_square:
+                print(f"Training low-rank smoothing for layer {layername} with param ratio {param_ratio}...")
+                svd_linear = SVDLinear_Smoothed.from_linear_with_trained_smoothing(
+                    raw_linear,
+                    param_ratio=param_ratio,
+                    calib_data=activations[layername],
+                    args=args,
+                )          
+                return  # DEBUGGING TRAIN LOW RANK SMOOTH
+            else:
+                svd_linear = SVDLinear.from_linear(
+                    raw_linear,
+                    param_ratio=param_ratio,
+                    # alpha=args.alpha,
+                    # act_aware=args.act_aware,
+                    # sigma_fuse=args.sigma_fuse,
+                    # rank_align=args.rank_align,
+                )
+                raw_linear.to("cpu")
         
         # Replace original linear layer with SVD version
         setattr(info["father"], info["name"], svd_linear)
@@ -451,3 +468,450 @@ def effective_rank_entropy(y, eps=1e-12):
 
     H = -np.sum(p * np.log(p))
     return np.exp(H)
+
+
+
+
+
+###########
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from typing import Dict, Tuple, Optional, Callable
+import numpy as np
+
+
+class ActivationHook:
+    """
+    Context manager to capture intermediate layer activations during forward pass.
+    
+    Usage:
+        hook = ActivationHook(model.layer1)
+        with hook:
+            output = model(input_data)
+        activations = hook.activations  # (batch_size, in_features)
+    """
+    
+    def __init__(self, layer: nn.Module):
+        self.layer = layer
+        self.activations = None
+        self.handle = None
+    
+    def _hook_fn(self, module, input, output):
+        """Capture the input to the module (pre-activation)"""
+        # input is a tuple, first element is the actual input
+        self.activations = input[0].detach().cpu()
+    
+    def __enter__(self):
+        self.handle = self.layer.register_forward_hook(self._hook_fn)
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.handle is not None:
+            self.handle.remove()
+
+
+def extract_layer_activations(
+    model: nn.Module,
+    target_layer: nn.Module,
+    dataloader: DataLoader,
+    max_batches: Optional[int] = None,
+    device: str = "cuda",
+) -> torch.Tensor:
+    """
+    Extract activations (inputs) to a specific layer by running forward passes.
+    
+    Args:
+        model: The full model
+        target_layer: The specific layer whose input activations we want
+        dataloader: DataLoader with calibration data (images, text tokens, etc.)
+        max_batches: Max number of batches to process (None = all)
+        device: Device to run on
+    
+    Returns:
+        Activations tensor of shape (total_samples, *input_shape)
+    
+    Example:
+        X = extract_layer_activations(
+            model, 
+            model.fc2,  # Get activations going INTO fc2
+            calib_loader,
+            max_batches=10
+        )
+    """
+    model.eval()
+    activations_list = []
+    
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dataloader):
+            if max_batches and batch_idx >= max_batches:
+                break
+            
+            # Handle different batch formats
+            if isinstance(batch, (list, tuple)):
+                inputs = batch[0]
+            else:
+                inputs = batch
+            
+            inputs = inputs.to(device)
+            
+            # Capture activations with hook
+            with ActivationHook(target_layer) as hook:
+                _ = model(inputs)
+                if hook.activations is not None:
+                    activations_list.append(hook.activations)
+    
+    # Concatenate all batches
+    X = torch.cat(activations_list, dim=0)
+    return X
+
+
+def extract_all_layer_activations(
+    model: nn.Module,
+    test_loader: DataLoader,
+    layer_names: list,
+    max_batches: Optional[int] = None,
+    device: str = "cuda",
+) -> Dict[str, torch.Tensor]:
+    """
+    Extract activations for multiple layers in a single forward pass.
+    More efficient than calling extract_layer_activations separately.
+    
+    Args:
+        model: The full model
+        test_loader: DataLoader with calibration data
+        layer_names: List of (layer_name, layer_module) tuples or dict
+        max_batches: Max batches to process
+        device: Device to run on
+    
+    Returns:
+        Dictionary mapping layer names to their activation tensors
+    
+    Example:
+        activations = extract_all_layer_activations(
+            model,
+            calib_loader,
+            layer_names=['fc1', 'fc2', 'fc3'],
+            max_batches=20
+        )
+        X_fc1 = activations['fc1']
+    """
+    model.eval()
+    hooks = {}
+    activations_dict = {name: [] for name in layer_names}
+    
+    # Register hooks for all layers
+    def make_hook(name):
+        def hook_fn(module, input, output):
+            activations_dict[name].append(input[0].detach().cpu())
+        return hook_fn
+    
+    for name in layer_names:
+        layer = dict(model.named_modules())[name]
+        hooks[name] = layer.register_forward_hook(make_hook(name))
+    
+    try:
+        with torch.no_grad():
+            
+            for idx, batch in tqdm(enumerate(test_loader), desc="Extracting Activations", unit="batch"):
+                batch_size = batch[0].shape[0] if isinstance(batch, (list, tuple)) else batch.shape[0]
+                batch_inputs = batch
+                _ = model(batch_inputs.to(device))
+                
+                if idx >= max_batches:
+                    break
+    
+    finally:
+        # Always remove hooks
+        for hook in hooks.values():
+            hook.remove()
+    
+    # Concatenate activations for each layer
+    result = {}
+    for name in layer_names:
+        if activations_dict[name]:
+            result[name] = torch.cat(activations_dict[name], dim=0)
+    
+    return result
+
+
+def get_layer_by_name(model: nn.Module, layer_name: str) -> nn.Module:
+    """
+    Get a layer module by its name from model.named_modules().
+    
+    Args:
+        model: PyTorch model
+        layer_name: Name of layer (e.g., 'layer1.0.conv1' or just 'fc1')
+    
+    Returns:
+        The layer module
+    """
+    for name, module in model.named_modules():
+        if name == layer_name:
+            return module
+    raise ValueError(f"Layer '{layer_name}' not found in model")
+
+
+def compute_activations_per_layer(
+    model: nn.Module,
+    dataloader: DataLoader,
+    module_dict: Dict[str, nn.Module],
+    layer_names: list,
+    max_samples: Optional[int] = None,
+    device: str = "cuda",
+) -> Dict[str, torch.Tensor]:
+    """
+    Compute activations for a list of layers. Optimized for your layer-by-layer
+    SVD compression workflow.
+    
+    Args:
+        model: The full model
+        dataloader: Calibration DataLoader
+        module_dict: Dictionary mapping layer names to modules (from your code)
+        layer_names: List of layer names to extract activations for
+        max_samples: Max total samples to collect
+        device: Device to run on
+    
+    Returns:
+        Dictionary: {layer_name: activations_tensor}
+        
+    Example:
+        activations = compute_activations_per_layer(
+            model, 
+            calib_loader,
+            module_dict,
+            layer_names=['fc1', 'fc2'],
+        )
+    """
+    model.to(device).eval()
+    
+    # Map layer names to actual modules
+    layers_to_hook = {}
+    for name in layer_names:
+        if name in module_dict:
+            layers_to_hook[name] = module_dict[name]
+        else:
+            # Try to get it from model
+            try:
+                layers_to_hook[name] = get_layer_by_name(model, name)
+            except ValueError:
+                print(f"Warning: Could not find layer '{name}'")
+    
+    # Extract activations
+    activations_dict = {name: [] for name in layers_to_hook.keys()}
+    total_samples = 0
+    
+    def make_hook(layer_name):
+        def hook_fn(module, input, output):
+            # Input to the linear layer is (batch_size, in_features)
+            activations_dict[layer_name].append(input[0].detach().cpu())
+        return hook_fn
+    
+    # Register hooks
+    handles = {}
+    for name, layer in layers_to_hook.items():
+        handles[name] = layer.register_forward_hook(make_hook(name))
+    
+    try:
+        with torch.no_grad():
+            for batch in dataloader:
+                # Handle different DataLoader formats
+                if isinstance(batch, (list, tuple)):
+                    inputs = batch[0]
+                else:
+                    inputs = batch
+                
+                inputs = inputs.to(device)
+                
+                # Forward pass to trigger hooks
+                try:
+                    _ = model(inputs)
+                except Exception as e:
+                    print(f"Error during forward pass: {e}")
+                    break
+                
+                total_samples += inputs.shape[0]
+                
+                if max_samples and total_samples >= max_samples:
+                    break
+    
+    finally:
+        # Remove all hooks
+        for handle in handles.values():
+            handle.remove()
+    
+    # Concatenate and return
+    result = {}
+    for name in layers_to_hook.keys():
+        if activations_dict[name]:
+            X = torch.cat(activations_dict[name], dim=0)
+            result[name] = X
+            print(f"Layer '{name}': Extracted {X.shape[0]} samples, shape {X.shape}")
+        else:
+            print(f"Warning: No activations collected for layer '{name}'")
+    
+    return result
+
+
+# ============================================================================
+# INTEGRATION: Modified version of your SVD loop with activation computation
+# ============================================================================
+
+def apply_svd_to_layers_with_activations(
+    model: nn.Module,
+    module_dict: Dict[str, nn.Module],
+    linear_info: Dict,
+    layers_min_ratio: Dict[str, float],
+    calib_loader: DataLoader,
+    SVDLinear,
+    SVDLinear_Smoothed,
+    default_param_ratio: float = 1.0,
+    train_low_rank_smoothing: bool = False,
+    device: str = "cuda",
+    max_calib_batches: Optional[int] = None,
+):
+    """
+    Complete SVD decomposition pipeline with activation extraction.
+    
+    This wraps your existing SVD loop and adds activation computation.
+    
+    Args:
+        model: The full model
+        module_dict: Dict mapping layer names to their modules
+        linear_info: Info dict for each layer
+        layers_min_ratio: Dict mapping layer names to compression ratios
+        calib_loader: Calibration data loader
+        SVDLinear: Your SVD layer class
+        SVDLinear_Smoothed: Your smoothed SVD layer class
+        default_param_ratio: Ratio for no compression
+        train_low_rank_smoothing: Whether to train smooth factors
+        device: Device to use
+        max_calib_batches: Limit calibration batches for speed
+    """
+    import time
+    from tqdm import tqdm
+    
+    model.to(device).eval()
+    
+    # STEP 1: Extract activations for all layers at once
+    print("=" * 60)
+    print("STEP 1: Extracting activations for all layers...")
+    print("=" * 60)
+    
+    layer_names = list(layers_min_ratio.keys())
+    activations = compute_activations_per_layer(
+        model,
+        calib_loader,
+        module_dict,
+        layer_names,
+        max_samples=None,
+        device=device,
+    )
+    
+    print(f"\nExtracted activations for {len(activations)} layers\n")
+    
+    # STEP 2: Apply SVD decomposition to each layer
+    print("=" * 60)
+    print("STEP 2: Applying SVD decomposition to layers...")
+    print("=" * 60)
+    
+    st = time.time()
+    
+    for layername, param_ratio in tqdm(layers_min_ratio.items()):
+        raw_linear = module_dict[layername]
+        info = linear_info[raw_linear]
+        
+        # Skip if using default ratio
+        if param_ratio == default_param_ratio:
+            svd_linear = raw_linear
+        else:
+            # Get activations for this layer
+            X = activations.get(layername)
+            
+            if X is None:
+                print(f"Warning: No activations for {layername}, skipping")
+                svd_linear = raw_linear
+            else:
+                print(f"\n{layername}:")
+                print(f"  Activations shape: {X.shape}")
+                print(f"  Layer weight shape: {raw_linear.weight.shape}")
+                print(f"  Compression ratio: {param_ratio}")
+                
+                if train_low_rank_smoothing:
+                    svd_linear = SVDLinear_Smoothed.from_linear_with_trained_smoothing(
+                        raw_linear,
+                        param_ratio=param_ratio,
+                        calib_data=X,  # Pass extracted activations
+                    )
+                else:
+                    svd_linear = SVDLinear.from_linear(
+                        raw_linear,
+                        param_ratio=param_ratio,
+                        # act_aware=True,  # Can use activations here
+                        # calib_data=X,
+                    )
+        
+        raw_linear.to("cpu")
+        
+        # Replace original layer with SVD version
+        setattr(info["father"], info["name"], svd_linear)
+    
+    ed = time.time()
+    print(f"\n{'=' * 60}")
+    print(f"Total decomposition time: {ed - st:.2f}s")
+    print(f"{'=' * 60}")
+    
+    return model
+
+
+# ============================================================================
+# MEMORY-EFFICIENT VARIANT: For very large models
+# ============================================================================
+
+def extract_activations_streaming(
+    model: nn.Module,
+    target_layer: nn.Module,
+    dataloader: DataLoader,
+    chunk_size: int = 1000,
+    device: str = "cuda",
+) -> torch.Tensor:
+    """
+    Extract activations in chunks to save memory for large datasets.
+    Returns activations one chunk at a time for processing.
+    
+    Args:
+        model: The full model
+        target_layer: Layer whose inputs we're capturing
+        dataloader: Calibration DataLoader
+        chunk_size: Number of samples to keep in memory per chunk
+        device: Device to run on
+    
+    Yields:
+        Chunks of activations of size (chunk_size, input_features)
+    """
+    model.eval()
+    buffer = []
+    
+    with torch.no_grad():
+        for batch in dataloader:
+            if isinstance(batch, (list, tuple)):
+                inputs = batch[0]
+            else:
+                inputs = batch
+            
+            inputs = inputs.to(device)
+            
+            with ActivationHook(target_layer) as hook:
+                _ = model(inputs)
+                if hook.activations is not None:
+                    buffer.append(hook.activations)
+            
+            # Yield when buffer is full
+            if sum(x.shape[0] for x in buffer) >= chunk_size:
+                yield torch.cat(buffer, dim=0)
+                buffer = []
+    
+    # Yield remaining
+    if buffer:
+        yield torch.cat(buffer, dim=0)

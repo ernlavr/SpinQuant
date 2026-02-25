@@ -373,8 +373,20 @@ def parser_gen():
     parser.add_argument(
         "--use_sensitivity_cache",
         type=str,
-        default=False,
+        default=None,
         help="Path to sensitivity cache file",
+    )
+    parser.add_argument(
+        "--test_loader_nsamples",
+        type=int,
+        default=4096,
+        help="Number of samples for the test data loader",
+    )
+    parser.add_argument(
+        "--test_loader_seqlen",
+        type=int,
+        default=256,
+        help="Sequence length for the test data loader",
     )
     parser.add_argument(
         "--train_loader_nsamples",
@@ -385,8 +397,14 @@ def parser_gen():
     parser.add_argument(
         "--train_loader_seqlen",
         type=int,
-        default=512,
+        default=256,
         help="Sequence length for the training data loader",
+    )
+    parser.add_argument(
+        "--train_bs",
+        type=int,
+        default=4,
+        help="Batch size for trainer data loader",
     )
     parser.add_argument(
         "--param_ratio_target",
@@ -401,6 +419,12 @@ def parser_gen():
         default=False,
     )
     parser.add_argument(
+        "--train_low_rank_smoothing",
+        action="store_true",
+        help="Train a smoothing function for better low-rank decomposition",
+        default=False,
+    )
+    parser.add_argument(
         "--train_per_layer",
         action="store_true",
         help="Train the model gradually, layer-by-layer",
@@ -412,6 +436,70 @@ def parser_gen():
         help="Use knowledge distillation during quantization",
         default=False,
     )
+    
+    parser.add_argument(
+        "--learning_rate",
+        type=float,
+        default=1e-3,
+        help="Learning rate for training the smoothing function or low-rank components",
+    )
+    parser.add_argument(
+        "--num_epochs",
+        type=int,
+        default=100,
+        help="Number of epochs for training the smoothing function or low-rank components",
+    )
+    parser.add_argument(
+        "--scaling_algo",
+        type=str,
+        default='both',
+        help="rows, cols, or both for the scaling in the SVD smoother training",
+    )
+    parser.add_argument(
+        "--optimizer_name",
+        type=str,
+        default="adam",
+        help="Optimizer to use for training the smoothing function or low-rank components (e.g., 'adam', 'sgd')",
+    )
+    parser.add_argument(
+        "--scheduler_name",
+        type=str,
+        default=None,
+        help="Scheduler to use for training the smoothing function or low-rank components (e.g., 'cosine', 'step', 'warmup_cosine')",
+    )
+    parser.add_argument(
+        "--l2_regularizer_scale",
+        type=float,
+        default=0.001,
+        help="L2 regularization scale to apply to the low-rank components during training of the smoothing function or low-rank components",
+    )
+    parser.add_argument(
+        "--add_regularizing_noise",
+        type=float,
+        default=1e-7,
+        help="Regularizing noise to stabilize SVD during training",
+    )
+    parser.add_argument(
+        "--lr_scheduler_type",
+        type=str,
+        default="linear",
+        help="Learning rate scheduler type (e.g., 'linear', 'cosine') for training the smoothing function or low-rank components",
+    )
+    parser.add_argument(
+        "--intercept_sanitize_grad",
+        type=bool,
+        default=False,
+        help="Whether to sanitize gradients for the intercept term in the SVD smoother training, which can help stabilize training"
+    )
+    
+    parser.add_argument(
+        "--optimizer_constraint",
+        type=str,
+        default=None,
+        help="Constraint to apply to the optimizer updates during training of the smoothing function or low-rank components, 'clamp', 'l2', or None ",
+    )
+    
+    
 
     args, unknown = parser.parse_known_args()
 

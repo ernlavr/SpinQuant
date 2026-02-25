@@ -541,7 +541,7 @@ def add_actquant(
         torch.nn.Linear,
         QuantizeLinear,
         ActQuantWrapper,
-        transformers.models.falcon.modeling_falcon.FalconLinear,
+        # transformers.models.falcon.modeling_falcon.FalconLinear
     ],
 ) -> None:
     if isinstance(module, ActQuantWrapper):

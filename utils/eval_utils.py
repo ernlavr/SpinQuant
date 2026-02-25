@@ -200,7 +200,7 @@ def _evaluator_multiple_gpus(model, testenc, dev, args):
         for i in range(nbatches):
             batch = input_ids[i]
             try:
-                model(batch)
+                model(batch.to(model.device))
             except ValueError:
                 pass
         layers[0] = layers[0].module
@@ -633,4 +633,81 @@ def _evaluator_single_gpu(model, testenc, dev, args):
     print(f"Variance Time per Token: {var_time_per_token:.4f} ms/token")
     print()
     print(f"Average PPL: {avg_ppl:.3f}")
+    return avg_ppl, avg_time_per_token
+
+
+@torch.no_grad()
+def evaluator_single_gpu_simplified(model, testenc, dev, args):
+    """
+    Simple perplexity evaluation on a single GPU.
+    
+    Args:
+        model: The language model to evaluate
+        testenc: Test encoding (should have .input_ids attribute)
+        dev: Device to run on
+        args: Arguments containing batch_size and nb_eval_runs
+    
+    Returns:
+        avg_ppl: Average perplexity across runs
+        avg_time_per_token: Average inference time per token
+    """
+    model.eval()
+    dev = model.device
+    
+    print(f"INFO: Running {args.nb_eval_runs} evaluation passes")
+    
+    list_ppl = []
+    list_time_per_token = []
+    
+    nsamples, seq_len = testenc.dataset.shape
+    total_tokens = nsamples * seq_len
+    
+    for run in range(args.nb_eval_runs):
+        # get nsamples and seq_len of testenc
+        
+        print(f"INFO: Evaluating {nsamples} samples with seq_len={seq_len}; Total tokens: {total_tokens}")
+        
+        # Compute loss and perplexity
+        nlls = []
+        loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
+        
+        torch.cuda.synchronize()
+        start_time = time.perf_counter()
+        
+        for batch_input_ids in tqdm(testenc, desc=f"(Eval Run {run+1}/{args.nb_eval_runs})"):
+            # if device map is auto then dontt move input ids to model device, otherwise move to model device
+            batch_input_ids = batch_input_ids.to(model.device)
+            logits = model(batch_input_ids).logits  # (batch_size, seq_len, vocab_size)
+            
+            # Shift for next-token prediction
+            shift_logits = logits[:, :-1, :].contiguous()  # (batch_size, seq_len-1, vocab_size)
+            shift_labels = batch_input_ids[:, 1:]  # (batch_size, seq_len-1)
+            
+            # Compute loss
+            loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1))
+            nlls.append(loss.detach().cpu())
+            
+        
+        torch.cuda.synchronize()
+        end_time = time.perf_counter()
+        elapsed_time_ms = (end_time - start_time) * 1000
+        
+        # Calculate perplexity
+        nll = torch.cat(nlls).mean()
+        ppl = torch.exp(nll)
+        
+        time_per_token_ms = elapsed_time_ms / total_tokens if total_tokens > 0 else 0
+        
+        list_ppl.append(ppl.item())
+        list_time_per_token.append(time_per_token_ms)
+        
+        print(f"Run {run+1}: PPL={ppl.item():.3f}, Time/Token={time_per_token_ms:.4f} ms/token")
+    
+    # Calculate averages
+    avg_ppl = sum(list_ppl) / len(list_ppl)
+    avg_time_per_token = sum(list_time_per_token) / len(list_time_per_token)
+    
+    print(f"\nAverage PPL: {avg_ppl:.3f}")
+    print(f"Average Time per Token: {avg_time_per_token:.4f} ms/token")
+    torch.cuda.empty_cache()
     return avg_ppl, avg_time_per_token

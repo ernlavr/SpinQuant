@@ -36,7 +36,18 @@ def get_wikitext2(nsamples=128, seed=0, seqlen=2048, model="", tokenizer=None, e
             "test"
         ]
         testenc = tokenizer("\n\n".join(testdata["text"]), return_tensors="pt")
-        return testenc
+        # Remove batch dimension
+        input_ids = testenc['input_ids'].squeeze(0)  # Shape: (289007,)
+        num_sequences = len(input_ids) // seqlen
+        input_ids = input_ids[:num_sequences * seqlen]
+        sequences = input_ids.view(num_sequences, seqlen)
+        dataloader = torch.utils.data.DataLoader(
+            sequences,
+            batch_size=bs,
+            shuffle=False
+        )
+        
+        return dataloader
     else:
         traindata = datasets.load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1")[
             "train"
@@ -55,7 +66,7 @@ def get_wikitext2(nsamples=128, seed=0, seqlen=2048, model="", tokenizer=None, e
         # create a dataloader
         trainloader = torch.utils.data.DataLoader(
             TupleDataset(trainloader), 
-            batch_size=4, 
+            batch_size=bs, 
             shuffle=True,
         )
         return trainloader
