@@ -4,6 +4,9 @@ import torch.nn.functional as F
 import numpy as np
 import math
 
+from train_utils.svd_smoother import train_svd_compressor, train_svd_smoother
+import utils.low_rank_utils as lru
+
 
 class SVDLinear(nn.Module):
     """ from https://github.com/hahnyuan/ASVD4LLM/blob/main/modules/svd_linear.py """
@@ -36,6 +39,7 @@ class SVDLinear(nn.Module):
         sigma_fuse="UV",
         rank_align=1,
     ):
+        
         # if param_ratio >= 1:
         #     return linear
         n_params = linear.weight.numel()
@@ -104,12 +108,19 @@ class SVDLinear(nn.Module):
         new_linear.to(linear.weight.dtype)
         return new_linear
 
-    def forward(self, inp):
+    def forward(self, inp):        
         # compute USV^Tx + b
         y = self.BLinear(inp)
         y = self.ALinear(y)
         return y
 
+    @staticmethod
+    def smooth(x, lam=1):
+        return torch.log1p(x)
+
+    @staticmethod
+    def inverse(y, lam=1):
+        return torch.expm1(y)
 
 class GradSVDLinear(nn.Module):
     """ from https://github.com/hahnyuan/ASVD4LLM/blob/main/modules/svd_linear.py """
@@ -215,3 +226,112 @@ class LowRankLinear(nn.Module):
     def extra_repr(self) -> str:
         return (f'in_features={self.in_features}, out_features={self.out_features}, '
                 f'rank={self.rank}, bias={self.bias is not None}')
+        
+        
+class SVDLinear_Smoothed(nn.Module):
+    """ from https://github.com/hahnyuan/ASVD4LLM/blob/main/modules/svd_linear.py """
+    def __init__(self, L, R, bias=None, sigma_fuse="UV") -> None:
+        super().__init__()
+        self.ALinear = nn.Linear(L.size(1), L.size(0), bias=bias is not None)
+
+        if bias is not None:
+            self.ALinear.bias.data = bias
+        self.BLinear = nn.Linear(R.size(1), R.size(0), bias=False)
+        self.truncation_rank = L.size(0)
+        
+        self.ALinear.weight.data = L.contiguous()
+        self.BLinear.weight.data = R.contiguous()
+        
+            
+    @staticmethod
+    def from_linear_with_trained_smoothing(linear: nn.Linear, param_ratio: float, rank_align=1, calib_data=None, args=None):
+        n_params = linear.weight.numel()
+        compressed_params = int(n_params * param_ratio)
+        rank = compressed_params // (linear.in_features + linear.out_features)
+        rank = int(np.ceil(rank / rank_align) * rank_align)
+        
+        
+        L, R, loss_history = train_svd_compressor(linear.weight.data.float(), calib_data, rank, args, num_epochs=args.num_epochs, lr=1e-4)
+        new_linear = SVDLinear_Smoothed(L, R)
+        new_linear.to(linear.weight.dtype)
+        return new_linear
+        
+        
+        
+
+    @staticmethod
+    def from_linear(
+        linear: nn.Linear,
+        param_ratio: float,
+        act_aware=False,
+        ic_split=1,
+        oc_split=1,
+        alpha=1,
+        sigma_fuse="UV",
+        rank_align=1,
+    ):
+
+        # print("rank", rank)
+        w = linear.weight.data.float()
+        if act_aware:
+            scaling_diag_matrix = 1  # avoid zero division
+            if hasattr(linear, "scaling_diag_matrix"):
+                # print("WARNING: scaling_diag_matrix is used")
+                scaling_diag_matrix *= linear.scaling_diag_matrix**alpha
+                # scaling_diag_matrix *= linear.scaling_diag_matrix**0.5
+            if hasattr(linear, "fisher_info"):
+                scaling_diag_matrix *= linear.fisher_info**alpha
+                # scaling_diag_matrix *= linear.fisher_info**1
+            # if not (scaling_diag_matrix == scaling_diag_matrix).all():
+            #     breakpoint()
+            scaling_diag_matrix += 1e-6  # avoid zero division
+            w = w * scaling_diag_matrix.view(1, -1)
+        Us = []
+        Ss = []
+        Vs = []
+        try:
+            U, S, V = torch.svd_lowrank(w, q=rank)
+        except:
+            print(f"svd failed for {linear}, disable act_aware")
+            return nn.Linear(linear.in_features, linear.out_features).to(linear.weight.dtype).to(linear.weight.device)
+        if act_aware:
+            V = V / scaling_diag_matrix.view(-1, 1)
+        Us = [U]
+        Ss = [S]
+        Vs = [V]
+
+        if linear.bias is not None:
+            bias = linear.bias.data
+        else:
+            bias = None
+
+        # nan or inf check
+        for S in Ss:
+            if (S != S).any():
+                print("nan in S")
+                return (
+                    nn.Linear(linear.in_features, linear.out_features).to(linear.weight.dtype).to(linear.weight.device)
+                )
+        for U in Us:
+            if (U != U).any():
+                print("nan in U")
+                return (
+                    nn.Linear(linear.in_features, linear.out_features).to(linear.weight.dtype).to(linear.weight.device)
+                )
+        for V in Vs:
+            if (V != V).any():
+                print("nan in V")
+                return (
+                    nn.Linear(linear.in_features, linear.out_features).to(linear.weight.dtype).to(linear.weight.device)
+                )
+
+        assert len(Us) == len(Ss) == len(Vs) == 1
+        new_linear = SVDLinear(Us[0], Ss[0], Vs[0], bias, sigma_fuse)
+        new_linear.to(linear.weight.dtype)
+        return new_linear
+
+    def forward(self, inp):
+        # compute USV^Tx + b
+        y = self.BLinear(inp)
+        y = self.ALinear(y)
+        return y
