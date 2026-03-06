@@ -24,7 +24,7 @@ from utils.hadamard_utils import (
     random_hadamard_matrix,
 )
 from utils.utils import HadamardTransform
-
+from utils.low_rank_utils import perform_svd_decomp
 
 def random_orthogonal_matrix(size, device):
     """
@@ -115,6 +115,9 @@ def rotate_attention_inputs(layer, R1) -> None:
     for W in [layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj]:
         dtype = W.weight.dtype
         W_ = W.weight.to(device="cuda", dtype=torch.float64)
+        
+        u, s, vh = perform_svd_decomp(W_)
+        
         W.weight.data = torch.matmul(W_, R1).to(device="cpu", dtype=dtype)
 
 
@@ -214,8 +217,8 @@ def rotate_model(model, args):
         print(f"INFO (rotate_model): Found optimized rotation path: {R_cpk}")
         R1 = torch.load(R_cpk)["R1"].cuda().to(torch.float64)
         
-        if args.noise_scalar is not None:
-            R1 = perturb_rotation_matrix(R1, noise_scale=args.noise_scalar, device="cuda", args=args)
+        # if args.noise_scalar is not None:
+        #     R1 = perturb_rotation_matrix(R1, noise_scale=args.noise_scalar, device="cuda", args=args)
         
     # add random gaussian noise to R1
     # gaussian = (torch.randn_like(R1) * R1.std() + R1.mean()) * 0.1
@@ -236,9 +239,13 @@ def rotate_model(model, args):
         else:
             R2 = get_orthogonal_matrix(head_dim, args.rotate_mode)
         # adding noise
-        if args.noise_scalar is not None:
-            R2 = perturb_rotation_matrix(R2, noise_scale=args.noise_scalar, device="cuda", args=args)
+        # if args.noise_scalar is not None:
+        #     R2 = perturb_rotation_matrix(R2, noise_scale=args.noise_scalar, device="cuda", args=args)
         # end noise
+        
+        u, s, vh = perform_svd_decomp(model.model.embed_tokens.weight.data)
+        
+        
         rotate_attention_inputs(layers[idx], R1)
         rotate_attention_output(layers[idx], R1)
         rotate_mlp_input(layers[idx], R1)

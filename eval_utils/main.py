@@ -17,6 +17,7 @@ import re
 
 from eval_utils import gptq_utils, rotation_utils
 from utils import data_utils, fuse_norm_utils, hadamard_utils, quant_utils, utils
+from utils import low_rank_utils
 from utils.convert_to_executorch import (
     sanitize_checkpoint_from_spinquant,
     write_model_llama,
@@ -112,7 +113,8 @@ def ptq_model(args, model, model_args=None, preloaded_q_state_dict=None): # args
         print("INFO: Applying base rotation (R1, R2 offline)...")
         fuse_norm_utils.fuse_layer_norms(model)
         # Pass args down so rotate_mlp_output can check flags/list for R4^T weight comp
-        rotation_utils.rotate_model(model, args) # This calls modified rotate_mlp_output
+        low_rank_utils.decompose_model(model, args)
+        # rotation_utils.rotate_model(model, args) # This calls modified rotate_mlp_output
         utils.cleanup_memory(verbos=True)
         quant_utils.add_actquant(model) # Add wrappers regardless of online had mode
 
