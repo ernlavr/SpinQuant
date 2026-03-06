@@ -3,127 +3,277 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import math
+from typing import Dict, Optional
 
-from train_utils.svd_smoother import train_svd_compressor, train_svd_smoother
+import train_utils.svd_smoother as svd_smoother
 import utils.low_rank_utils as lru
+from transformers import AutoConfig, AutoModelForCausalLM, LlamaConfig, LlamaForCausalLM
 
+
+# ---------------------------------------------------------------------------
+# Custom HuggingFace config & model for SVD-compressed Llama
+# ---------------------------------------------------------------------------
+
+class SVDLlamaConfig(LlamaConfig):
+    """
+    Extends LlamaConfig with per-layer SVD rank information.
+
+    ``svd_layers_config`` maps each replaced module's dot-separated path
+    (as returned by ``model.named_modules()``) to the truncation rank used,
+    e.g. ``{"model.layers.0.self_attn.q_proj": 64, ...}``.
+    """
+    model_type = "svd_llama"
+
+    def __init__(self, svd_layers_config: Optional[Dict[str, int]] = None, **kwargs):
+        self.svd_layers_config = svd_layers_config or {}
+        super().__init__(**kwargs)
+
+
+class SVDLlamaForCausalLM(LlamaForCausalLM):
+    """
+    LlamaForCausalLM variant that reconstructs SVDLinear modules from the
+    config on instantiation.  Used as the target class when calling
+    ``SVDLlamaForCausalLM.from_pretrained(saved_dir)``.
+    """
+    config_class = SVDLlamaConfig
+
+    def __init__(self, config: SVDLlamaConfig):
+        super().__init__(config)
+        
+        if not config.svd_layers_config:
+            return
+
+        # Build a flat {path: module} map once — O(N) instead of O(N * depth)
+        module_map = {name: mod for name, mod in self.named_modules()}
+
+        for module_path, rank in config.svd_layers_config.items():
+            parts = module_path.rsplit(".", 1)
+            parent_path, attr = (parts[0], parts[1]) if len(parts) == 2 else ("", parts[0])
+            parent = module_map[parent_path] if parent_path else self
+            
+            original = getattr(parent, attr)
+            out_f, in_f = original.weight.shape
+            has_bias = original.bias is not None
+            dtype = original.weight.dtype
+            device = original.weight.device  # 'meta' during from_pretrained
+
+            L = torch.zeros(out_f, rank, dtype=dtype, device=device)
+            R = torch.zeros(rank, in_f, dtype=dtype, device=device)
+            bias_placeholder = (
+                torch.zeros(out_f, dtype=dtype, device=device) if has_bias else None
+            )
+            setattr(parent, attr, SVDLinear(L, R, bias_placeholder))
+
+
+# Register so that AutoConfig / AutoModelForCausalLM work transparently.
+AutoConfig.register("svd_llama", SVDLlamaConfig)
+AutoModelForCausalLM.register(SVDLlamaConfig, SVDLlamaForCausalLM)
+
+
+# ---------------------------------------------------------------------------
+# SVDLinear  (merged from the previous SVDLinear + SVDLinear_Smoothed)
+# ---------------------------------------------------------------------------
 
 class SVDLinear(nn.Module):
-    """ from https://github.com/hahnyuan/ASVD4LLM/blob/main/modules/svd_linear.py """
-    def __init__(self, U, S, V, bias=None, sigma_fuse="UV") -> None:
-        super().__init__()
-        self.ALinear = nn.Linear(U.size(1), U.size(0), bias=bias is not None)
+    """
+    Drop-in replacement for nn.Linear using a low-rank factorisation
+    W ≈ A @ B, where A has shape (out_features, rank) and B has shape
+    (rank, in_features).
 
-        if bias is not None:
-            self.ALinear.bias.data = bias
-        self.BLinear = nn.Linear(V.size(1), V.size(0), bias=False)
-        self.truncation_rank = S.size(0)
+    The forward pass executes two small matmuls instead of one large one:
+        y = ALinear(BLinear(x)) + bias
+
+    Construction
+    ------------
+    * ``SVDLinear(L, R, bias)``                      — from pre-computed factors
+    * ``SVDLinear.from_svd(U, S, V, bias, ...)``     — from SVD components
+    * ``SVDLinear.from_linear(linear, ratio, ...)``  — compress an nn.Linear
+    * ``SVDLinear.from_linear_with_trained_smoothing(...)`` — gradient-trained
+    """
+
+    def __init__(
+        self,
+        L: torch.Tensor,
+        R: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> None:
+        super().__init__()
+        out_features, rank = L.shape
+        in_features = R.shape[1]
+        assert R.shape[0] == rank, f"L/R rank mismatch: L has rank {rank}, R has rank {R.shape[0]}"
+
+        # ALinear : (rank,) → (out_features,)
+        self.ALinear = nn.Linear(rank, out_features, bias=bias is not None)
+        if L.device.type != "meta":
+            self.ALinear.weight.data = L.contiguous()
+            if bias is not None:
+                self.ALinear.bias.data = bias.contiguous()
+
+        # BLinear : (in_features,) → (rank,)
+        self.BLinear = nn.Linear(in_features, rank, bias=False)
+        if R.device.type != "meta":
+            self.BLinear.weight.data = R.contiguous()
+
+    # ------------------------------------------------------------------
+    # Factory methods
+    # ------------------------------------------------------------------
+    @property
+    def weight(self) -> torch.Tensor:
+        """Reconstruct the full weight matrix from the factors."""
+        return self.ALinear.weight @ self.BLinear.weight
+
+    @classmethod
+    def from_svd(
+        cls,
+        U: torch.Tensor,
+        S: torch.Tensor,
+        V: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+        sigma_fuse: str = "UV",
+    ) -> "SVDLinear":
+        """
+        Build from the output of torch.svd_lowrank:
+            U : (out_features, rank)
+            S : (rank,)
+            V : (in_features, rank)
+        The full approximation is  U diag(S) V^T.
+        """
         if sigma_fuse == "UV":
-            self.ALinear.weight.data = U.mul(S.sqrt()).contiguous()
-            self.BLinear.weight.data = V.t().mul(S.sqrt().view(-1, 1)).contiguous()
+            L = U.mul(S.sqrt()).contiguous()
+            R = V.t().mul(S.sqrt().view(-1, 1)).contiguous()
         elif sigma_fuse == "U":
-            self.ALinear.weight.data = U.mul(S).contiguous()
-            self.BLinear.weight.data = V.t().contiguous()
+            L = U.mul(S).contiguous()
+            R = V.t().contiguous()
         elif sigma_fuse == "V":
-            self.ALinear.weight.data = U.contiguous()
-            self.BLinear.weight.data = V.t().mul(S.view(-1, 1)).contiguous()
+            L = U.contiguous()
+            R = V.t().mul(S.view(-1, 1)).contiguous()
+        else:
+            raise ValueError(f"Unknown sigma_fuse mode: {sigma_fuse!r}")
+        return cls(L, R, bias)
 
     @staticmethod
     def from_linear(
         linear: nn.Linear,
         param_ratio: float,
-        act_aware=False,
-        ic_split=1,
-        oc_split=1,
-        alpha=1,
-        sigma_fuse="UV",
-        rank_align=1,
-    ):
-        
-        # if param_ratio >= 1:
-        #     return linear
+        act_aware: bool = False,
+        ic_split: int = 1,
+        oc_split: int = 1,
+        alpha: float = 1.0,
+        sigma_fuse: str = "UV",
+        rank_align: int = 1,
+    ) -> "SVDLinear":
+        """Compress an nn.Linear to target parameter ratio via truncated SVD."""
         n_params = linear.weight.numel()
         compressed_params = int(n_params * param_ratio)
         assert ic_split == 1 or oc_split == 1
         rank = compressed_params // (linear.in_features + linear.out_features)
-        # rank align
-        rank = int(np.ceil(rank / rank_align) * rank_align)
+        rank = max(1, int(np.ceil(rank / rank_align) * rank_align))
 
-        # print("rank", rank)
         w = linear.weight.data.float()
         if act_aware:
-            scaling_diag_matrix = 1  # avoid zero division
+            scaling = torch.ones(linear.in_features, device=w.device, dtype=w.dtype)
             if hasattr(linear, "scaling_diag_matrix"):
-                # print("WARNING: scaling_diag_matrix is used")
-                scaling_diag_matrix *= linear.scaling_diag_matrix**alpha
-                # scaling_diag_matrix *= linear.scaling_diag_matrix**0.5
+                scaling = scaling * linear.scaling_diag_matrix ** alpha
             if hasattr(linear, "fisher_info"):
-                scaling_diag_matrix *= linear.fisher_info**alpha
-                # scaling_diag_matrix *= linear.fisher_info**1
-            # if not (scaling_diag_matrix == scaling_diag_matrix).all():
-            #     breakpoint()
-            scaling_diag_matrix += 1e-6  # avoid zero division
-            w = w * scaling_diag_matrix.view(1, -1)
-        Us = []
-        Ss = []
-        Vs = []
+                scaling = scaling * linear.fisher_info ** alpha
+            scaling = scaling + 1e-6
+            w = w * scaling.view(1, -1)
+
         try:
             U, S, V = torch.svd_lowrank(w, q=rank)
-        except:
-            print(f"svd failed for {linear}, disable act_aware")
-            return nn.Linear(linear.in_features, linear.out_features).to(linear.weight.dtype).to(linear.weight.device)
+        except Exception:
+            print(f"SVD failed for {linear}, returning original linear")
+            return linear  # type: ignore[return-value]
+
         if act_aware:
-            V = V / scaling_diag_matrix.view(-1, 1)
-        Us = [U]
-        Ss = [S]
-        Vs = [V]
+            V = V / scaling.view(-1, 1)
 
-        if linear.bias is not None:
-            bias = linear.bias.data
+        if (S != S).any() or (U != U).any() or (V != V).any():
+            print("NaN in SVD output, returning original linear")
+            return linear  # type: ignore[return-value]
+
+        bias = linear.bias.data if linear.bias is not None else None
+        return SVDLinear.from_svd(U, S, V, bias, sigma_fuse).to(linear.weight.dtype)
+
+    @staticmethod
+    def from_linear_with_trained_smoothing(
+        linear: nn.Linear,
+        param_ratio: float,
+        rank_align: int = 1,
+        calib_data: Optional[torch.Tensor] = None,
+        args=None,
+    ) -> "SVDLinear":
+        """Gradient-train L and R to minimise reconstruction loss on calib_data."""
+        n_params = linear.weight.numel()
+        compressed_params = int(n_params * param_ratio)
+        rank = compressed_params // (linear.in_features + linear.out_features)
+        rank = max(1, int(np.ceil(rank / rank_align) * rank_align))
+
+        num_epochs = getattr(args, "num_epochs", 100)
+        
+        if args.train_svd_scalers_sequentially:
+            print(f"Training SVD scalers sequentially for layer with param ratio {param_ratio}...")
+            L, R, _loss_history = svd_smoother.train_svd_scalers_sequentially(
+                linear.weight.data.float(), calib_data, rank, args,
+                num_epochs=num_epochs, lr=1e-4,
+            )
         else:
-            bias = None
+            print(f"Training SVD scalers jointly for layer with param ratio {param_ratio}...")
+            L, R, _loss_history = svd_smoother.train_svd_compressor(
+                linear.weight.data.float(), calib_data, rank, args,
+                num_epochs=num_epochs, lr=1e-4,
+            )
+            
+        bias = linear.bias.data if linear.bias is not None else None
+        return SVDLinear(L, R, bias).to(linear.weight.dtype)
 
-        # nan or inf check
-        for S in Ss:
-            if (S != S).any():
-                print("nan in S")
-                return (
-                    nn.Linear(linear.in_features, linear.out_features).to(linear.weight.dtype).to(linear.weight.device)
-                )
-        for U in Us:
-            if (U != U).any():
-                print("nan in U")
-                return (
-                    nn.Linear(linear.in_features, linear.out_features).to(linear.weight.dtype).to(linear.weight.device)
-                )
-        for V in Vs:
-            if (V != V).any():
-                print("nan in V")
-                return (
-                    nn.Linear(linear.in_features, linear.out_features).to(linear.weight.dtype).to(linear.weight.device)
-                )
+    # ------------------------------------------------------------------
+    # Forward / utilities
+    # ------------------------------------------------------------------
 
-        assert len(Us) == len(Ss) == len(Vs) == 1
-        new_linear = SVDLinear(Us[0], Ss[0], Vs[0], bias, sigma_fuse)
-        new_linear.to(linear.weight.dtype)
-        return new_linear
+    def forward(self, inp: torch.Tensor) -> torch.Tensor:
+        return self.ALinear(self.BLinear(inp))
 
-    def forward(self, inp):        
-        # compute USV^Tx + b
-        y = self.BLinear(inp)
-        y = self.ALinear(y)
-        return y
+    def to_linear(self) -> nn.Linear:
+        """
+        Return a standard nn.Linear whose weight equals ALinear.weight @ BLinear.weight.
+        Useful for exporting a merged (non-compressed) checkpoint.
+        """
+        A = self.ALinear.weight.data   # (out_features, rank)
+        B = self.BLinear.weight.data   # (rank, in_features)
+        dtype, device = A.dtype, A.device
 
-    @staticmethod
-    def smooth(x, lam=1):
-        return torch.log1p(x)
+        full_weight = (A.float() @ B.float()).to(dtype)
+        has_bias = self.ALinear.bias is not None
+        linear = nn.Linear(
+            full_weight.shape[1], full_weight.shape[0],
+            bias=has_bias, device=device, dtype=dtype,
+        )
+        linear.weight.data.copy_(full_weight)
+        if has_bias:
+            linear.bias.data.copy_(self.ALinear.bias.data)
+        return linear
 
-    @staticmethod
-    def inverse(y, lam=1):
-        return torch.expm1(y)
+    @property
+    def truncation_rank(self) -> int:
+        return self.BLinear.weight.shape[0]
+
+    def extra_repr(self) -> str:
+        in_f = self.BLinear.weight.shape[1]
+        out_f = self.ALinear.weight.shape[0]
+        return (
+            f"in_features={in_f}, out_features={out_f}, "
+            f"rank={self.truncation_rank}, bias={self.ALinear.bias is not None}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# GradSVDLinear  (unchanged — re-computes SVD every forward for gradient flow)
+# ---------------------------------------------------------------------------
 
 class GradSVDLinear(nn.Module):
-    """ from https://github.com/hahnyuan/ASVD4LLM/blob/main/modules/svd_linear.py """
+    """Applies scaled SVD every forward pass to allow gradient through the rank."""
+
     def __init__(self, weight, scale, bias, rank) -> None:
         super().__init__()
         self.weight = weight
@@ -133,7 +283,13 @@ class GradSVDLinear(nn.Module):
 
     @staticmethod
     def from_linear(
-        linear: nn.Linear, param_ratio: float, act_aware=False, ic_split=1, oc_split=1, alpha=1, sigma_fuse="UV"
+        linear: nn.Linear,
+        param_ratio: float,
+        act_aware: bool = False,
+        ic_split: int = 1,
+        oc_split: int = 1,
+        alpha: float = 1.0,
+        sigma_fuse: str = "UV",
     ):
         if param_ratio >= 1:
             return linear
@@ -141,197 +297,86 @@ class GradSVDLinear(nn.Module):
         compressed_params = int(n_params * param_ratio)
         assert ic_split == 1 or oc_split == 1
         rank = compressed_params // (linear.in_features + linear.out_features)
-        # print("rank", rank)
         w = linear.weight.data.float()
+        scaling = torch.ones(linear.in_features, device=w.device, dtype=w.dtype)
         if act_aware:
-            scaling_diag_matrix = 1  # avoid zero division
             if hasattr(linear, "scaling_diag_matrix"):
-                # print("WARNING: scaling_diag_matrix is used")
-                scaling_diag_matrix *= linear.scaling_diag_matrix**alpha
-                # scaling_diag_matrix *= linear.scaling_diag_matrix**0.5
+                scaling = scaling * linear.scaling_diag_matrix ** alpha
             if hasattr(linear, "fisher_info"):
-                scaling_diag_matrix *= linear.fisher_info**alpha
-                # scaling_diag_matrix *= linear.fisher_info**1
-            # if not (scaling_diag_matrix == scaling_diag_matrix).all():
-            #     breakpoint()
-            scaling_diag_matrix += 1e-6  # avoid zero division
-
-        if linear.bias is not None:
-            bias = linear.bias.data
-        else:
-            bias = None
-        return GradSVDLinear(w, scaling_diag_matrix, bias, rank)
+                scaling = scaling * linear.fisher_info ** alpha
+            scaling = scaling + 1e-6
+        bias = linear.bias.data if linear.bias is not None else None
+        return GradSVDLinear(w, scaling, bias, rank)
 
     def forward(self, inp):
         w = self.weight * self.scale.view(1, -1)
         U, S, V = torch.svd_lowrank(w, q=self.rank)
         new_w = U.mul(S).mm(V.t())
-        y = F.linear(inp, new_w, self.bias)
-        return y
-    
+        return F.linear(inp, new_w, self.bias)
+
+
+# ---------------------------------------------------------------------------
+# LowRankLinear  (parametric, for training from scratch)
+# ---------------------------------------------------------------------------
+
 class LowRankLinear(nn.Module):
     """
-    Replaces nn.Linear with a low-rank decomposition: W ≈ L @ R
-    where L: (in_features, rank) and R: (rank, out_features)
-    
-    Supports both inference and training (e.g., for student-teacher training).
+    Trainable low-rank factorisation: W ≈ L @ R
+        L : (in_features, rank)  — nn.Parameter
+        R : (rank, out_features) — nn.Parameter
+
+    Forward:  y = x @ L @ R + bias
     """
-    def __init__(self, in_features: int, out_features: int, rank: int, 
-                 bias: bool = True, device=None, dtype=None):
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        rank: int,
+        bias: bool = True,
+        device=None,
+        dtype=None,
+    ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.rank = rank
-        
-        # Low-rank factors
+
         self.L = nn.Parameter(torch.empty(in_features, rank, device=device, dtype=dtype))
         self.R = nn.Parameter(torch.empty(rank, out_features, device=device, dtype=dtype))
-        
-        # Optional bias (usually present in transformer models)
         if bias:
             self.bias = nn.Parameter(torch.empty(out_features, device=device, dtype=dtype))
         else:
-            self.register_parameter('bias', None)
-        
+            self.register_parameter("bias", None)
         self._reset_parameters()
-    
+
     def _reset_parameters(self):
-        """Initialize with proper scaling for training stability"""
-        # Initialize L and R with Xavier-like initialization scaled by rank
-        # This helps maintain activation scales during training
-        fan_in = self.in_features
-        fan_out = self.out_features
-        
-        # Scale initialization by 1/sqrt(rank) to keep output variance stable
-        scale_L = math.sqrt(2.0 / (fan_in + self.rank))
-        scale_R = math.sqrt(2.0 / (self.rank + fan_out))
-        
-        nn.init.normal_(self.L, std=scale_L)
-        nn.init.normal_(self.R, std=scale_R)
-        
+        nn.init.normal_(self.L, std=math.sqrt(2.0 / (self.in_features + self.rank)))
+        nn.init.normal_(self.R, std=math.sqrt(2.0 / (self.rank + self.out_features)))
         if self.bias is not None:
             nn.init.zeros_(self.bias)
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Compute: x @ L @ R + bias
-        # More efficient: x @ (L @ R) computed as (x @ L) @ R
-        x_proj = torch.matmul(x, self.L)  # (..., rank)
-        output = torch.matmul(x_proj, self.R)  # (..., out_features)
-        
-        if self.bias is not None:
-            output = output + self.bias
-        
-        return output
-    
+        return torch.matmul(torch.matmul(x, self.L), self.R) + (
+            self.bias if self.bias is not None else 0
+        )
+
+    def to_linear(self) -> nn.Linear:
+        """Return a merged nn.Linear equivalent. W = (L @ R).T"""
+        dtype, device = self.L.dtype, self.L.device
+        full_weight = (self.L.data.float() @ self.R.data.float()).T.to(dtype)
+        has_bias = self.bias is not None
+        linear = nn.Linear(
+            full_weight.shape[1], full_weight.shape[0],
+            bias=has_bias, device=device, dtype=dtype,
+        )
+        linear.weight.data.copy_(full_weight)
+        if has_bias:
+            linear.bias.data.copy_(self.bias.data)
+        return linear
+
     def extra_repr(self) -> str:
-        return (f'in_features={self.in_features}, out_features={self.out_features}, '
-                f'rank={self.rank}, bias={self.bias is not None}')
-        
-        
-class SVDLinear_Smoothed(nn.Module):
-    """ from https://github.com/hahnyuan/ASVD4LLM/blob/main/modules/svd_linear.py """
-    def __init__(self, L, R, bias=None, sigma_fuse="UV") -> None:
-        super().__init__()
-        self.ALinear = nn.Linear(L.size(1), L.size(0), bias=bias is not None)
-
-        if bias is not None:
-            self.ALinear.bias.data = bias
-        self.BLinear = nn.Linear(R.size(1), R.size(0), bias=False)
-        self.truncation_rank = L.size(0)
-        
-        self.ALinear.weight.data = L.contiguous()
-        self.BLinear.weight.data = R.contiguous()
-        
-            
-    @staticmethod
-    def from_linear_with_trained_smoothing(linear: nn.Linear, param_ratio: float, rank_align=1, calib_data=None, args=None):
-        n_params = linear.weight.numel()
-        compressed_params = int(n_params * param_ratio)
-        rank = compressed_params // (linear.in_features + linear.out_features)
-        rank = int(np.ceil(rank / rank_align) * rank_align)
-        
-        
-        L, R, loss_history = train_svd_compressor(linear.weight.data.float(), calib_data, rank, args, num_epochs=args.num_epochs, lr=1e-4)
-        new_linear = SVDLinear_Smoothed(L, R)
-        new_linear.to(linear.weight.dtype)
-        return new_linear
-        
-        
-        
-
-    @staticmethod
-    def from_linear(
-        linear: nn.Linear,
-        param_ratio: float,
-        act_aware=False,
-        ic_split=1,
-        oc_split=1,
-        alpha=1,
-        sigma_fuse="UV",
-        rank_align=1,
-    ):
-
-        # print("rank", rank)
-        w = linear.weight.data.float()
-        if act_aware:
-            scaling_diag_matrix = 1  # avoid zero division
-            if hasattr(linear, "scaling_diag_matrix"):
-                # print("WARNING: scaling_diag_matrix is used")
-                scaling_diag_matrix *= linear.scaling_diag_matrix**alpha
-                # scaling_diag_matrix *= linear.scaling_diag_matrix**0.5
-            if hasattr(linear, "fisher_info"):
-                scaling_diag_matrix *= linear.fisher_info**alpha
-                # scaling_diag_matrix *= linear.fisher_info**1
-            # if not (scaling_diag_matrix == scaling_diag_matrix).all():
-            #     breakpoint()
-            scaling_diag_matrix += 1e-6  # avoid zero division
-            w = w * scaling_diag_matrix.view(1, -1)
-        Us = []
-        Ss = []
-        Vs = []
-        try:
-            U, S, V = torch.svd_lowrank(w, q=rank)
-        except:
-            print(f"svd failed for {linear}, disable act_aware")
-            return nn.Linear(linear.in_features, linear.out_features).to(linear.weight.dtype).to(linear.weight.device)
-        if act_aware:
-            V = V / scaling_diag_matrix.view(-1, 1)
-        Us = [U]
-        Ss = [S]
-        Vs = [V]
-
-        if linear.bias is not None:
-            bias = linear.bias.data
-        else:
-            bias = None
-
-        # nan or inf check
-        for S in Ss:
-            if (S != S).any():
-                print("nan in S")
-                return (
-                    nn.Linear(linear.in_features, linear.out_features).to(linear.weight.dtype).to(linear.weight.device)
-                )
-        for U in Us:
-            if (U != U).any():
-                print("nan in U")
-                return (
-                    nn.Linear(linear.in_features, linear.out_features).to(linear.weight.dtype).to(linear.weight.device)
-                )
-        for V in Vs:
-            if (V != V).any():
-                print("nan in V")
-                return (
-                    nn.Linear(linear.in_features, linear.out_features).to(linear.weight.dtype).to(linear.weight.device)
-                )
-
-        assert len(Us) == len(Ss) == len(Vs) == 1
-        new_linear = SVDLinear(Us[0], Ss[0], Vs[0], bias, sigma_fuse)
-        new_linear.to(linear.weight.dtype)
-        return new_linear
-
-    def forward(self, inp):
-        # compute USV^Tx + b
-        y = self.BLinear(inp)
-        y = self.ALinear(y)
-        return y
+        return (
+            f"in_features={self.in_features}, out_features={self.out_features}, "
+            f"rank={self.rank}, bias={self.bias is not None}"
+        )

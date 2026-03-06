@@ -9,6 +9,7 @@
 # Licensed under Apache License 2.0.
 
 from dataclasses import dataclass, field
+import json
 from typing import Optional, Tuple
 
 import argparse
@@ -436,17 +437,23 @@ def parser_gen():
         help="Use knowledge distillation during quantization",
         default=False,
     )
+    parser.add_argument(
+        "--fine_tune_after_compression",
+        action="store_true",
+        help="Fine-tune the model after compression",
+        default=False,
+    )
     
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=1e-3,
+        default=0.005,
         help="Learning rate for training the smoothing function or low-rank components",
     )
     parser.add_argument(
         "--num_epochs",
         type=int,
-        default=100,
+        default=1000,
         help="Number of epochs for training the smoothing function or low-rank components",
     )
     parser.add_argument(
@@ -458,7 +465,7 @@ def parser_gen():
     parser.add_argument(
         "--optimizer_name",
         type=str,
-        default="adam",
+        default="adamw",
         help="Optimizer to use for training the smoothing function or low-rank components (e.g., 'adam', 'sgd')",
     )
     parser.add_argument(
@@ -470,13 +477,13 @@ def parser_gen():
     parser.add_argument(
         "--l2_regularizer_scale",
         type=float,
-        default=0.001,
+        default=0.000001,
         help="L2 regularization scale to apply to the low-rank components during training of the smoothing function or low-rank components",
     )
     parser.add_argument(
         "--add_regularizing_noise",
         type=float,
-        default=1e-7,
+        default=1e-6,
         help="Regularizing noise to stabilize SVD during training",
     )
     parser.add_argument(
@@ -486,6 +493,18 @@ def parser_gen():
         help="Learning rate scheduler type (e.g., 'linear', 'cosine') for training the smoothing function or low-rank components",
     )
     parser.add_argument(
+        "--add_term_to_loss",
+        type=str,
+        default=None,
+        help="Additional term to add to the loss during training of the smoothing function, 'entropy' for effective rank entropy minimization, 'participation' for effective rank participation ratio minimization",
+    )
+    parser.add_argument(
+        "--term_loss_scaler",
+        type=float,
+        default=None,
+        help="Scaling factor to apply to the additional loss term (e.g., effective rank entropy or participation ratio) during training of the smoothing function",
+    )
+    parser.add_argument(
         "--intercept_sanitize_grad",
         type=bool,
         default=False,
@@ -493,10 +512,37 @@ def parser_gen():
     )
     
     parser.add_argument(
-        "--optimizer_constraint",
+        "--compress_specific_module",
         type=str,
         default=None,
+        help="The full name of a single module to apply compression to in format model.layers.31.self_attn.q_proj. If not provided, compression is applied to all modules.",
+    )
+    
+    parser.add_argument(
+        "--optimizer_constraint",
+        type=str,
+        default="l2",
         help="Constraint to apply to the optimizer updates during training of the smoothing function or low-rank components, 'clamp', 'l2', or None ",
+    )
+    
+    parser.add_argument(
+        "--compress_specific_layers",
+        type=json.loads,
+        default=None,
+        help="Define a list of layers to apply compression to in format [0, 1, 2, 3, 4] or None to apply to all layers",
+    )
+    
+    parser.add_argument(
+        "--train_svd_scalers_sequentially",
+        type=bool,
+        default=False,
+        help="Trains SVD scalers sequentially, one at a time, instead of all at once.",
+    )
+    parser.add_argument(
+        "--save_svd_model",
+        type=bool,
+        default=False,
+        help="Save the SVD model (U, S, V) after training the scalers",
     )
     
     

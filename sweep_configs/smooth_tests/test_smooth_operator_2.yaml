@@ -1,0 +1,25 @@
+method: grid # grid, bayes, random
+metric:
+  name: 'loss'
+  goal: 'minimize'
+
+parameters:
+  l2_regularizer_scale:
+    values:
+      - 0.00001
+      - 0.000001
+
+  add_regularizing_noise:
+    values:
+      - 1e-6
+
+  scheduler_name:
+    values:
+      - plateau
+      - none
+
+  learning_rate:
+    values:
+      - 0.01
+      - 0.005
+      - 0.001

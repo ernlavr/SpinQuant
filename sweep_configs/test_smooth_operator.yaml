@@ -1,0 +1,42 @@
+# used in https://wandb.ai/ernlavr/spinquant-noise/sweeps/18p90ezn?nw=nwuserernestslavrinovics
+method: grid # grid, bayes, random
+metric:
+  name: 'loss'
+  goal: 'minimize'
+
+parameters:
+  param_ratio_target:
+    values:
+      - 0.75
+      - 0.5
+
+  scaling_algo:
+    values:
+      - cols
+      - rows
+      - both
+
+  scheduler_name:
+    values:
+      - cosine
+      - step
+      - exponential
+      - plateau
+      - none
+
+  learning_rate:
+    values:
+      - 0.001
+      - 0.0001
+      - 0.00005
+      - 0.00001
+      
+  train_low_rank_smoothing:
+    values:
+      - True
+  
+
+  # train_per_layer:
+  #   values:
+  #     - True
+  #     - False

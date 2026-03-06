@@ -246,6 +246,25 @@ def get_scheduler(optimizer, num_epochs, args):
             
     return scheduler
 
+def train_svd_compressor_alternating_optimization(W, X, rank, args, num_epochs=40, lr=1e-2, device=None):
+    """
+    Alternate optimization of low-rank factors L and R for weight compression.
+    
+    This optimizes L and R in an alternating fashion to minimize reconstruction error
+    on the given activation data X.
+    
+    Args:
+        W: Original weight matrix (torch.Tensor, shape: d_out x d_in)
+        X: Activation data (torch.Tensor, shape: d_in x batch_size or batch_size x d_in)
+        rank: Target rank for compression
+        num_epochs: Number of training epochs
+        lr: Learning rate
+        device: Device to place tensors on
+    Returns:
+        L, R: Optimized low-rank factors such that W_approx = L @ R
+        loss_history: List of loss values during training
+    """
+
 def train_svd_compressor(W, X, rank, args, num_epochs=40, lr=1e-2, device=None):
     """
     Optimize weight compression using learnable singular value scaling.
@@ -273,6 +292,8 @@ def train_svd_compressor(W, X, rank, args, num_epochs=40, lr=1e-2, device=None):
     batch, tokens, d_in = X.shape
     X = X.reshape(-1, d_in)
     
+    
+    
     # Ensure X is in the right shape (d_in x batch_size)
     if X.shape[0] != W.shape[1]:
         if X.shape[1] == W.shape[1]:
@@ -297,38 +318,6 @@ def train_svd_compressor(W, X, rank, args, num_epochs=40, lr=1e-2, device=None):
             "baseline/entropy_no_smooth": entr,
             "baseline/participation_no_smooth": particip,
         })
-    
-        
-    # output_dir = "output_dir/singular_values_smoother/hadamard_100/"
-    # for i in tqdm(range(100), desc="Hadamard Trials"):
-    #     # Row scaling
-    #     D_r = torch.diag(torch.randn(W.shape[0])).to(W.dtype).to(W.device)
-    #     D_r_inv = torch.diag(1.0 / torch.diag(D_r))
-
-    #     # Column scaling
-    #     D_c = torch.diag(torch.randn(W.shape[1])).to(W.dtype).to(W.device)
-    #     D_c_inv = torch.diag(1.0 / torch.diag(D_c))
-        
-    #     # Apply scaling
-    #     W_scaled = D_r @ W @ D_c
-    #     U_scaled, S_scaled, V_scaled = torch.linalg.svd(W_scaled, full_matrices=False)
-        
-    #     # Truncate in scaled space
-    #     U_trunc, S_trunc, V_trunc = truncate_svd(U_scaled, S_scaled, V_scaled, rank)
-        
-    #     # RECOVER to original space before computing loss
-    #     W_trunc_scaled = U_trunc @ torch.diag(S_trunc) @ V_trunc
-        
-    #     # Recover original space
-    #     W_trunc = D_r_inv @ W_trunc_scaled @ D_c_inv
-        
-    #     # Now loss is comparing original W to truncated approximation
-    #     loss_scaled = loss_fn_wprime(W, W_trunc, X, mode="frobenius")
-        
-    #     entr, particip = print_plot_stats(S_scaled, rank, plot_name=f"Rand_diag{i}", output_dir=output_dir)
-    #     print(f"Hadamard {i}, Entropy: {entr:.2f}, Participation: {particip:.2f}; Loss: {loss_scaled.item():.6f}")
-        
-    
         
     # Compute statistics of W for smart initialization
     w_std = W.std().item()
@@ -351,20 +340,11 @@ def train_svd_compressor(W, X, rank, args, num_epochs=40, lr=1e-2, device=None):
     
     optimizer = None
     if scaling == "cols":
-        if args.optimizer_constraint == "adamw":
-            optimizer = torch.optim.AdamW([d_c], lr=lr, weight_decay=l2_regularizer_scale)
-        else:
-            optimizer = torch.optim.Adam([d_c], lr=lr)
+        optimizer = torch.optim.AdamW([d_c], lr=lr, weight_decay=l2_regularizer_scale)
     elif scaling == "rows":
-        if args.optimizer_constraint == "adamw":
-            optimizer = torch.optim.AdamW([d_r], lr=lr, weight_decay=l2_regularizer_scale)
-        else:
-            optimizer = torch.optim.Adam([d_r], lr=lr)
+        optimizer = torch.optim.AdamW([d_r], lr=lr, weight_decay=l2_regularizer_scale)
     elif scaling == "both":
-        if args.optimizer_constraint == "adamw":
-            optimizer = torch.optim.AdamW([d_r, d_c], lr=lr, weight_decay=l2_regularizer_scale)
-        else:
-            optimizer = torch.optim.Adam([d_r, d_c], lr=lr)
+        optimizer = torch.optim.AdamW([d_r, d_c], lr=lr, weight_decay=l2_regularizer_scale)
     
     print(optimizer)
     scheduler = get_scheduler(optimizer, num_epochs, args)
@@ -412,15 +392,12 @@ def train_svd_compressor(W, X, rank, args, num_epochs=40, lr=1e-2, device=None):
         
         # SVD in scaled space
         U_scaled, S_scaled, V_scaled = torch.linalg.svd(W_scaled, full_matrices=False)
-        print(f"  NaN After SVD - U: {torch.isnan(U_scaled).any()}; S: {torch.isnan(S_scaled).any()}; V: {torch.isnan(V_scaled).any()}")
         
         # Truncate in scaled space
         U_trunc, S_trunc, V_trunc = truncate_svd(U_scaled, S_scaled, V_scaled, rank)
-        print(f"  NaN After truncate - U: {torch.isnan(U_trunc).any()}, S: {torch.isnan(S_trunc).any()}, V: {torch.isnan(V_trunc).any()}")
         
         # Recover original space
         W_trunc_scaled = U_trunc @ torch.diag(S_trunc) @ V_trunc
-        print(f"  NaN After reconstruction - W_trunc_scaled: {torch.isnan(W_trunc_scaled).any()}")
         
         if scaling == "cols":
             W_trunc = W_trunc_scaled @ D_c_inv  # Only column scaling, so recover with D_c_inv
@@ -428,12 +405,10 @@ def train_svd_compressor(W, X, rank, args, num_epochs=40, lr=1e-2, device=None):
             W_trunc = D_r_inv @ W_trunc_scaled  # Only row scaling, so recover with D_r_inv
         elif scaling == "both":
             W_trunc = D_r_inv @ W_trunc_scaled @ D_c_inv
-        print(f"  NaN After recovery - W_trunc: {torch.isnan(W_trunc).any()}")
         
         
         optimizer.zero_grad()
         loss = loss_fn_wprime(W, W_trunc, X, mode="frobenius")
-        print(f"  NaN Loss: {torch.isnan(loss)}, Loss value: {loss.item()}")
     
         if torch.isnan(loss):
             print("NaN detected in loss! Stopping.")
@@ -451,21 +426,26 @@ def train_svd_compressor(W, X, rank, args, num_epochs=40, lr=1e-2, device=None):
             loss = loss + norm
         
         # if adding  entropy minimization, use scaling 1e-4 to 1e-6
+        entropy = None
+        participation = None
+        loss_w_term = None
         if add_term_to_loss == 'entropy':
-            loss += effective_rank_entropy(S_trunc) * add_term_loss_scaler
+            entropy = effective_rank_entropy(S_trunc) * add_term_loss_scaler
+            loss_w_term = loss + entropy
         elif add_term_to_loss == 'participation':
-            loss += effective_rank_participation(S_trunc) * add_term_loss_scaler
+            participation = effective_rank_participation(S_trunc) * add_term_loss_scaler
+            loss_w_term = loss + participation
         
-        loss.backward()
+        if add_term_to_loss is not None:
+            loss_w_term.backward()
+        else:
+            loss.backward()
         
         # sanitize gradients for intercept term if enabled
-        
         if intercept_sanitize_grad:
             n = intercept_sanitize_nans(d_r, d_c)
             if n > 0:
                 num_sanitized += 1  # This will be updated by the sanitize function
-        
-        torch.nn.utils.clip_grad_norm_([d_r, d_c], max_norm=1.0)
         optimizer.step()
         
         
@@ -498,8 +478,20 @@ def train_svd_compressor(W, X, rank, args, num_epochs=40, lr=1e-2, device=None):
                 "learning_rate": scheduler.get_last_lr()[0] if scheduler is not None else lr,
             }
             
+            if add_term_to_loss is not None:
+                log_dict["loss_with_term"] = loss_w_term.item()
+            
             if num_sanitized is not None:
                 log_dict["num_sanitized"] = num_sanitized
+                
+            if entropy is not None:
+                log_dict["entropy"] = entropy.item()
+            
+            if participation is not None:
+                log_dict["participation"] = participation.item()
+            
+            if loss_w_term is not None:
+                log_dict["loss_with_term"] = loss_w_term.item()
 
             wandb.log(log_dict)
         
@@ -593,3 +585,437 @@ def compute_compression_ratio(W, rank):
     original_params = d_out * d_in
     compressed_params = d_out * rank + rank + rank * d_in
     return original_params / compressed_params
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def _run_svd_training_phase(
+    W, X, rank, args,
+    d_r, d_c,
+    params_to_train,   # list of nn.Parameter objects to optimize in this phase
+    scaling,           # "rows" | "cols" | "both"
+    num_epochs=40,
+    lr=1e-2,
+    phase_name="",
+):
+    """
+    Shared inner training loop used by both simultaneous and alternating optimizers.
+
+    Args:
+        W:               Original weight matrix (d_out x d_in)
+        X:               Activation data, already transposed to (d_in x N)
+        rank:            Target rank
+        args:            Argument namespace (same as callers receive)
+        d_r:             Row-scaling nn.Parameter  (d_out,)
+        d_c:             Col-scaling nn.Parameter  (d_in,)
+        params_to_train: Which of [d_r, d_c] to pass to the optimizer
+        scaling:         Which scaling matrices are active
+        num_epochs:      Epochs to run
+        lr:              Base learning rate (overridden by args.learning_rate)
+        phase_name:      String prefix used in log / print messages
+
+    Returns:
+        loss_history: list of per-epoch loss values
+    """
+    lr                    = args.learning_rate
+    l2_regularizer_scale  = args.l2_regularizer_scale
+    regularizing_noise    = args.add_regularizing_noise
+    intercept_sanitize_grad = args.intercept_sanitize_grad
+    add_term_to_loss      = args.add_term_to_loss
+    add_term_loss_scaler  = args.term_loss_scaler
+
+    prefix = f"[{phase_name}] " if phase_name else ""
+    print(
+        f"{prefix}Training SVD smoother | scaling={scaling}, lr={lr}, "
+        f"l2={l2_regularizer_scale}, noise={regularizing_noise}, "
+        f"sanitize_grad={intercept_sanitize_grad}"
+    )
+
+    optimizer = torch.optim.AdamW(params_to_train, lr=lr, weight_decay=l2_regularizer_scale)
+    print(optimizer)
+    scheduler = get_scheduler(optimizer, num_epochs, args)
+
+    loss_history        = []
+    gradient_norms_d_r  = []
+    gradient_norms_d_c  = []
+    num_sanitized       = 0
+    time_started        = time.time()
+    times               = []
+    output_dir          = "output_dir/singular_values_smoother/hadamard_100/"
+
+    for epoch in tqdm(range(num_epochs)):
+        # ------------------------------------------------------------------ #
+        # Build scaling matrices from current parameters                      #
+        # ------------------------------------------------------------------ #
+        D_r, D_c, D_r_inv, D_c_inv = None, None, None, None
+        if scaling in ("rows", "both"):
+            D_r     = torch.diag(torch.exp(d_r))
+            D_r_inv = torch.diag(torch.exp(-d_r))
+        if scaling in ("cols", "both"):
+            D_c     = torch.diag(torch.exp(d_c))
+            D_c_inv = torch.diag(torch.exp(-d_c))
+
+        print(f"{prefix}Epoch {epoch}")
+        if D_r is not None:
+            print(
+                f"  exp(d_r) range: [{torch.exp(d_r).min():.4f}, {torch.exp(d_r).max():.4f}]"
+                f"  mean: {torch.exp(d_r).mean():.4f}  std: {torch.exp(d_r).std():.4f}"
+            )
+        if D_c is not None:
+            print(
+                f"  exp(d_c) range: [{torch.exp(d_c).min():.4f}, {torch.exp(d_c).max():.4f}]"
+                f"  mean: {torch.exp(d_c).mean():.4f}  std: {torch.exp(d_c).std():.4f}"
+            )
+
+        # ------------------------------------------------------------------ #
+        # Apply scaling, optional noise, SVD + truncation                     #
+        # ------------------------------------------------------------------ #
+        if scaling == "cols":
+            W_scaled = W @ D_c
+        elif scaling == "rows":
+            W_scaled = D_r @ W
+        else:  # both
+            W_scaled = D_r @ W @ D_c
+
+        if regularizing_noise is not None:
+            W_scaled = W_scaled + torch.randn_like(W_scaled) * regularizing_noise
+
+        print(f"  W_scaled has NaN? {torch.isnan(W_scaled).any()}")
+
+        U_scaled, S_scaled, V_scaled = torch.linalg.svd(W_scaled, full_matrices=False)
+        U_trunc, S_trunc, V_trunc    = truncate_svd(U_scaled, S_scaled, V_scaled, rank)
+        W_trunc_scaled               = U_trunc @ torch.diag(S_trunc) @ V_trunc
+
+        if scaling == "cols":
+            W_trunc = W_trunc_scaled @ D_c_inv
+        elif scaling == "rows":
+            W_trunc = D_r_inv @ W_trunc_scaled
+        else:  # both
+            W_trunc = D_r_inv @ W_trunc_scaled @ D_c_inv
+
+        # ------------------------------------------------------------------ #
+        # Loss + optional auxiliary terms                                     #
+        # ------------------------------------------------------------------ #
+        optimizer.zero_grad()
+        loss = loss_fn_wprime(W, W_trunc, X, mode="frobenius")
+
+        if torch.isnan(loss):
+            print(f"{prefix}NaN detected in loss! Stopping.")
+            break
+
+        if args.optimizer_constraint in ("l2", "all"):
+            if scaling == "cols":
+                norm = l2_regularizer_scale * torch.norm(d_c) ** 2
+            elif scaling == "rows":
+                norm = l2_regularizer_scale * torch.norm(d_r) ** 2
+            else:
+                norm = l2_regularizer_scale * (torch.norm(d_r) ** 2 + torch.norm(d_c) ** 2)
+            loss = loss + norm
+
+        entropy, participation, loss_w_term = None, None, None
+        if add_term_to_loss == "entropy":
+            entropy      = effective_rank_entropy(S_trunc) * add_term_loss_scaler
+            loss_w_term  = loss + entropy
+        elif add_term_to_loss == "participation":
+            participation = effective_rank_participation(S_trunc) * add_term_loss_scaler
+            loss_w_term   = loss + participation
+
+        (loss_w_term if loss_w_term is not None else loss).backward()
+
+        if intercept_sanitize_grad:
+            n = intercept_sanitize_nans(d_r, d_c)
+            if n > 0:
+                num_sanitized += 1
+
+        optimizer.step()
+
+        if scheduler is not None:
+            if scheduler.__class__.__name__ == "ReduceLROnPlateau":
+                scheduler.step(loss)
+            else:
+                scheduler.step()
+
+        # ------------------------------------------------------------------ #
+        # Bookkeeping                                                         #
+        # ------------------------------------------------------------------ #
+        loss_history.append(loss.item())
+
+        if d_r.grad is not None:
+            gradient_norms_d_r.append(d_r.grad.norm().item())
+        if d_c.grad is not None:
+            gradient_norms_d_c.append(d_c.grad.norm().item())
+
+        time_elapsed = time.time() - time_started
+        time_started = time.time()
+        times.append(time_elapsed)
+
+        if wandb.run is not None:
+            log_dict = {
+                f"{phase_name}/loss": loss.item(),
+                f"{phase_name}/learning_rate": (
+                    scheduler.get_last_lr()[0] if scheduler is not None else lr
+                ),
+            }
+            if loss_w_term  is not None: log_dict[f"{phase_name}/loss_with_term"] = loss_w_term.item()
+            if num_sanitized:            log_dict[f"{phase_name}/num_sanitized"]  = num_sanitized
+            if entropy      is not None: log_dict[f"{phase_name}/entropy"]        = entropy.item()
+            if participation is not None:log_dict[f"{phase_name}/participation"]  = participation.item()
+            wandb.log(log_dict)
+
+        torch.cuda.empty_cache()
+
+        if epoch % 1 == 0:
+            recent_loss = sum(loss_history[-10:]) / max(len(loss_history[-10:]), 1)
+            mean_time   = sum(times[-10:])        / max(len(times[-10:]),        1)
+            entr, particip = print_plot_stats(
+                S_scaled, rank,
+                plot_name=f"{phase_name}_Epoch{epoch}",
+                output_dir=output_dir,
+            )
+            gnr = np.array(gradient_norms_d_r[-10:]) if gradient_norms_d_r else np.zeros(1)
+            gnc = np.array(gradient_norms_d_c[-10:]) if gradient_norms_d_c else np.zeros(1)
+            print(
+                f"{prefix}Epoch {epoch:3d} | Loss: {loss.item():.6f} | "
+                f"Avg10: {recent_loss:.6f} | Time: {mean_time:.4f}s | "
+                f"Entropy: {entr:.2f} | Participation: {particip:.2f} | "
+                f"grad d_r={gnr.mean():.4f} | grad d_c={gnc.mean():.4f}"
+            )
+
+        # Early stopping
+        if len(loss_history) > 100:
+            recent_avg = sum(loss_history[-50:])   / 50
+            prev_avg   = sum(loss_history[-100:-50]) / 50
+            if abs(prev_avg - recent_avg) < 1e-4:
+                print(f"{prefix}Early stopping at epoch {epoch}: minimal improvement.")
+                break
+            if recent_avg > prev_avg:
+                print(f"{prefix}Early stopping at epoch {epoch}: loss is increasing.")
+                break
+
+    return loss_history
+
+
+# --------------------------------------------------------------------------- #
+# Public API                                                                   #
+# --------------------------------------------------------------------------- #
+
+def _init_parameters_and_baseline(W, X, rank, args, device):
+    """
+    Shared setup: move tensors, reshape X, print baseline SVD loss, and
+    initialise d_r / d_c parameters.
+
+    Returns:
+        W, X, d_r, d_c   (all on device, X in shape d_in x N)
+    """
+    W = W.to(device)
+    X = X.to(device)
+
+    batch, tokens, d_in = X.shape
+    X = X.reshape(-1, d_in)
+
+    if X.shape[0] != W.shape[1]:
+        if X.shape[1] == W.shape[1]:
+            X = X.T
+        else:
+            raise ValueError(
+                f"X shape {X.shape} incompatible with W shape {W.shape}. "
+                f"Expected {W.shape[1]} features."
+            )
+
+    # Baseline (no smoothing)
+    U_ns, S_ns, V_ns = torch.linalg.svd(W, full_matrices=False)
+    loss_no_smooth    = loss_fn(W, (U_ns, S_ns, V_ns), X, rank, mode="frobenius")
+    entr, particip    = print_plot_stats(S_ns, rank, plot_name="No_Smooth")
+    print(
+        f"Truncated Loss: {loss_no_smooth.item():.6f}; "
+        f"Entropy: {entr:.2f}, Participation: {particip:.2f}"
+    )
+    if wandb.run is not None:
+        wandb.log({
+            "baseline/loss":                  loss_no_smooth.item(),
+            "baseline/entropy_no_smooth":     entr,
+            "baseline/participation_no_smooth": particip,
+        })
+
+    w_std = W.std().item()
+    d_r   = nn.Parameter(torch.randn(W.shape[0], device=W.device, dtype=W.dtype) * w_std * 0.1)
+    d_c   = nn.Parameter(torch.randn(W.shape[1], device=W.device, dtype=W.dtype) * w_std * 0.1)
+
+    return W, X, d_r, d_c
+
+
+def _build_LR(W, rank, d_r, d_c, scaling):
+    """Convert optimised scaling parameters into L, R matrices in original space."""
+    D_r, D_c, D_r_inv, D_c_inv = None, None, None, None
+    if scaling in ("rows", "both"):
+        D_r     = torch.diag(torch.exp(d_r))
+        D_r_inv = torch.diag(torch.exp(-d_r))
+    if scaling in ("cols", "both"):
+        D_c     = torch.diag(torch.exp(d_c))
+        D_c_inv = torch.diag(torch.exp(-d_c))
+
+    if scaling == "cols":
+        W_fs = W @ D_c
+    elif scaling == "rows":
+        W_fs = D_r @ W
+    else:
+        W_fs = D_r @ W @ D_c
+
+    U_f, S_f, V_f   = torch.linalg.svd(W_fs, full_matrices=False)
+    U_t, S_t, V_t   = truncate_svd(U_f, S_f, V_f, rank)
+
+    sqrt_S  = torch.sqrt(torch.diag(S_t))
+    L_scaled = U_t @ sqrt_S
+    R_scaled = sqrt_S @ V_t
+
+    if scaling == "cols":
+        L, R = L_scaled, R_scaled @ D_c_inv
+    elif scaling == "rows":
+        L, R = D_r_inv @ L_scaled, R_scaled
+    else:
+        L, R = D_r_inv @ L_scaled, R_scaled @ D_c_inv
+
+    return L, R
+
+
+def train_svd_scalers_simultaneously(W, X, rank, args, num_epochs=40, lr=1e-2, device=None):
+    """
+    Optimize weight compression using learnable singular value scaling.
+    Trains d_r and d_c **simultaneously** to minimise reconstruction error on X.
+
+    Args:
+        W:          Original weight matrix  (d_out x d_in)
+        X:          Activation data         (batch x tokens x d_in)
+        rank:       Target rank
+        args:       Argument namespace
+        num_epochs: Training epochs
+        lr:         Learning rate (overridden by args.learning_rate)
+        device:     Target device
+
+    Returns:
+        L, R:          Low-rank factors such that W ≈ L @ R
+        loss_history:  Per-epoch loss values
+    """
+    print("Training SVD compressor with simultaneous optimization of d_r and d_c")
+    if device is None:
+        device = W.device
+
+    W, X, d_r, d_c = _init_parameters_and_baseline(W, X, rank, args, device)
+    scaling         = args.scaling_algo
+
+    # Determine which parameters to optimise
+    if scaling == "cols":
+        params = [d_c]
+    elif scaling == "rows":
+        params = [d_r]
+    else:  # both
+        params = [d_r, d_c]
+
+    loss_history = _run_svd_training_phase(
+        W, X, rank, args,
+        d_r=d_r, d_c=d_c,
+        params_to_train=params,
+        scaling=scaling,
+        num_epochs=num_epochs,
+        lr=lr,
+        phase_name="simultaneous",
+    )
+
+    with torch.no_grad():
+        L, R         = _build_LR(W, rank, d_r, d_c, scaling)
+        W_compressed = L @ R
+        final_loss   = loss_fn_wprime(W, W_compressed, X, mode="frobenius")
+        print(f"Final Loss after simultaneous training: {final_loss.item():.6f}")
+
+    return L, R, loss_history
+
+
+def train_svd_scalers_sequentially(W, X, rank, args, num_epochs=40, lr=1e-2, device=None):
+    """
+    Alternate optimization of low-rank factors for weight compression.
+
+    Trains d_c **fully** in Phase 1, then trains d_r **fully** in Phase 2
+    (with d_c held fixed).  Only meaningful when args.scaling_algo == "both";
+    falls back to simultaneous training otherwise.
+
+    Args:
+        W:          Original weight matrix  (d_out x d_in)
+        X:          Activation data         (batch x tokens x d_in)
+        rank:       Target rank
+        args:       Argument namespace
+        num_epochs: Epochs **per phase**
+        lr:         Learning rate (overridden by args.learning_rate)
+        device:     Target device
+
+    Returns:
+        L, R:          Low-rank factors such that W ≈ L @ R
+        loss_history:  Combined per-epoch loss values (phase 1 then phase 2)
+    """
+    if device is None:
+        device = W.device
+
+    W, X, d_r, d_c = _init_parameters_and_baseline(W, X, rank, args, device)
+    scaling         = args.scaling_algo
+
+    if scaling != "both":
+        # Nothing to alternate — delegate to the simultaneous trainer
+        print(
+            f"Warning: alternating optimisation requested but scaling='{scaling}'. "
+            "Falling back to simultaneous training."
+        )
+        return train_svd_compressor(W, X, rank, args, num_epochs=num_epochs, lr=lr, device=device)
+
+    # ------------------------------------------------------------------ #
+    # Phase 1: optimise d_r only (d_c frozen at its initial value)        #
+    # ------------------------------------------------------------------ #
+    print("\n" + "=" * 60)
+    print("PHASE 1 — optimising d_r (rows) with d_c frozen")
+    print("=" * 60)
+    loss_history_phase1 = _run_svd_training_phase(
+        W, X, rank, args,
+        d_r=d_r, d_c=d_c,
+        params_to_train=[d_r],
+        scaling="rows",          # only column scaling active this phase
+        num_epochs=num_epochs,
+        lr=lr,
+        phase_name="phase1_rows",
+    )
+
+    # ------------------------------------------------------------------ #
+    # Phase 2: optimise d_c only (d_r now fixed from Phase 1)             #
+    # ------------------------------------------------------------------ #
+    print("\n" + "=" * 60)
+    print("PHASE 2 — optimising d_c (cols) with d_r fixed")
+    print("=" * 60)
+    loss_history_phase2 = _run_svd_training_phase(
+        W, X, rank, args,
+        d_r=d_r, d_c=d_c,
+        params_to_train=[d_c],
+        scaling="both",          # both scalings applied; only d_r receives gradients
+        num_epochs=num_epochs,
+        lr=lr,
+        phase_name="phase2_cols",
+    )
+
+    with torch.no_grad():
+        L, R         = _build_LR(W, rank, d_r, d_c, scaling="both")
+        W_compressed = L @ R
+        final_loss   = loss_fn_wprime(W, W_compressed, X, mode="frobenius")
+        print(f"Final Loss after alternating training: {final_loss.item():.6f}")
+
+    return L, R, loss_history_phase1 + loss_history_phase2

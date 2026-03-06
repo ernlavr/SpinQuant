@@ -1,0 +1,20 @@
+method: grid # grid, bayes, random
+metric:
+  name: 'loss'
+  goal: 'minimize'
+
+parameters:
+  train_low_rank_smoothing:
+    values:
+      - True
+      - False
+
+  fine_tune_after_compression:
+    values:
+      - True
+      - False
+
+  use_distillation:
+    values:
+      - True
+      - False

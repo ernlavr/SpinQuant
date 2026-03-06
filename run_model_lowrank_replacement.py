@@ -1,3 +1,4 @@
+import gc
 import os
 import sys
 import torch
@@ -10,12 +11,13 @@ from typing import Tuple, Optional
 import math
 
 import wandb
-from train_utils.knowledge_distillation import DistillationConfig, KnowledgeDistiller
 from utils import low_rank_utils as lru
+from utils import model_utils
+from train_utils.knowledge_distillation import DistillationConfig, KnowledgeDistiller
 
 from utils import data_utils, eval_utils, utils
 from utils.process_args import process_args_ptq
-from modules.linears import LowRankLinear
+from modules.linears import LowRankLinear, SVDLinear
 import utils.wandb_utils as wandb_utils
 from dotenv import load_dotenv
 
@@ -29,7 +31,7 @@ def decompose_weight(weight: torch.Tensor, rank: int) -> Tuple[torch.Tensor, tor
     This provides a good initialization for training by preserving the original
     weight information as much as possible.
     
-    Args:
+    Args:a
         weight: Original weight matrix (out_features, in_features) from nn.Linear
         rank: Target rank for decomposition
     
@@ -60,6 +62,61 @@ def decompose_weight(weight: torch.Tensor, rank: int) -> Tuple[torch.Tensor, tor
     
     return L, R
 
+def memory_cleanup():
+    print(f"Before — reserved: {torch.cuda.memory_reserved() / 1024**2:.1f} MB")
+    gc.collect()
+    torch.cuda.empty_cache()
+    print(f"After  — reserved: {torch.cuda.memory_reserved() / 1024**2:.1f} MB")
+
+def get_models_data_tokenizer(model_args, training_args, ptq_args):
+    print(f"Loading student model from {model_args.input_model}...")
+    # student_model = model_utils.load_model("svd_llama", model_path="/eos/home-e/elavrino/git/SpinQuant/output_dir/saved_models/meta-llama_Llama-3.1-8B")
+    student_model = AutoModelForCausalLM.from_pretrained(
+        model_args.input_model,
+        device_map="auto" if torch.cuda.device_count() > 1 else "cuda",
+        token=model_args.access_token,
+        torch_dtype=torch.float32,
+        
+    )
+    
+    print(f"Loading teacher model from {model_args.input_model}...")
+    teacher_model = AutoModelForCausalLM.from_pretrained(
+        model_args.input_model,
+        device_map="auto" if torch.cuda.device_count() > 1 else "cuda",
+        token=model_args.access_token,
+    )
+    
+    # tokenizer, data loader
+    tokenizer = AutoTokenizer.from_pretrained(
+            pretrained_model_name_or_path=model_args.input_model,
+            cache_dir=training_args.cache_dir,
+            model_max_length=training_args.model_max_length,
+            padding_side="right",
+            use_fast=True,
+            add_eos_token=False,
+            add_bos_token=False,
+            token=model_args.access_token,
+        )
+    
+    test_loader = data_utils.get_wikitext2(
+            seed=ptq_args.seed,
+            seqlen=ptq_args.test_loader_seqlen,
+            nsamples=ptq_args.test_loader_nsamples,
+            tokenizer=tokenizer,
+            eval_mode=True,
+        )
+    
+    train_loader = data_utils.get_wikitext2(
+            seed=ptq_args.seed,
+            nsamples=ptq_args.train_loader_nsamples,
+            seqlen=ptq_args.train_loader_seqlen,
+            tokenizer=tokenizer,
+            eval_mode=False,
+            bs=ptq_args.train_bs,
+        )
+    print("Finished loading models, data, and tokenizer.")
+    
+    return student_model, teacher_model, tokenizer, test_loader, train_loader
 
 def replace_linear_with_lowrank(model: nn.Module, rank_modifier: float, 
                                 target_modules: Optional[list] = None,
@@ -157,7 +214,7 @@ def get_compression_stats(model: nn.Module) -> dict:
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     
     lowrank_params = sum(p.numel() for m in model.modules() 
-                        if isinstance(m, LowRankLinear) 
+                        if isinstance(m, SVDLinear) 
                         for p in m.parameters())
     
     return {
@@ -166,7 +223,7 @@ def get_compression_stats(model: nn.Module) -> dict:
         'lowrank_params': lowrank_params,
     }
 
-def perform_binary_search_truncation(model, sensitivity_dict, calib_loader, args):
+def perform_binary_search_truncation(model, sensitivity_dict, train_loader, calib_loader, args):
     return lru.binary_search_truncation_rank(model, sensitivity_dict, calib_loader, args)
     
 def test_calib_sensitivity_ppl(model, training_args, model_args, ptq_args):
@@ -191,53 +248,47 @@ def test_calib_sensitivity_ppl(model, training_args, model_args, ptq_args):
     return lru.calib_sensitivity_ppl(model, testloader, ptq_args, use_cache=ptq_args.use_sensitivity_cache)
     
 def process():
+    memory_cleanup()
+    # find_cuda_tensors()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model_args, training_args, ptq_args = process_args_ptq()
     utils.set_random_seeds(seed=ptq_args.seed)
-    print("Loading teacher model...")
-
-
-    print("Loading student model (will be compressed)...")
-    student_model = AutoModelForCausalLM.from_pretrained(
-        "meta-llama/Llama-3.1-8B",
-        torch_dtype=torch.float32,
-        device_map="auto",
-        token=model_args.access_token,
-    )
+    
+    student_model, teacher_model, tokenizer, test_loader, train_loader = get_models_data_tokenizer(model_args, training_args, ptq_args)
     student_model.seqlen = training_args.model_max_length
     uncompressed_stats = get_compression_stats(student_model)
-    print(f"Compressing student with param ratio target={ptq_args.param_ratio_target}...")
-    
-    # tokenizer, data loader
-    tokenizer = AutoTokenizer.from_pretrained(
-            pretrained_model_name_or_path=model_args.input_model,
-            cache_dir=training_args.cache_dir,
-            model_max_length=training_args.model_max_length,
-            padding_side="right",
-            use_fast=True,
-            add_eos_token=False,
-            add_bos_token=False,
-            token=model_args.access_token,
-        )
-    
-    testloader = data_utils.get_wikitext2(
-            seed=ptq_args.seed,
-            seqlen=2048,
-            tokenizer=tokenizer,
-            eval_mode=True,
-        )
-    uncompressed_ppl, avg_time_per_token = eval_utils.evaluator(student_model, testloader, utils.DEV, ptq_args) 
-    wandb.log({
-        "baseline/uncompressed_ppl": uncompressed_ppl,
-        "baseline/avg_time_per_token": avg_time_per_token,
-    })
+    print(f"Compressing student with param ratio target={ptq_args.param_ratio_target}...")    
+        
+    uncompressed_ppl, avg_time_per_token = eval_utils.evaluator_single_gpu_simplified(student_model, test_loader, utils.DEV, ptq_args) 
+    print(f"Uncompressed PPL before low-rank replacement: {uncompressed_ppl:.2f}")
+    if wandb.run is not None:
+        wandb.log({
+            "uncompressed/ppl": uncompressed_ppl,
+            "uncompressed/avg_time_per_token": avg_time_per_token,
+        })
     
     sensitivity = test_calib_sensitivity_ppl(student_model, training_args, model_args, ptq_args)
+    # if single gpu put on cuda
+    if torch.cuda.is_available() and torch.cuda.device_count() == 1:
+        student_model.to(device)
     
     if sensitivity is not None:
-        perform_binary_search_truncation(student_model, sensitivity, testloader, ptq_args)       
+        perform_binary_search_truncation(student_model, sensitivity, train_loader, test_loader, ptq_args)     
+        torch.cuda.empty_cache()  
+        if ptq_args.compress_specific_module is not None:
+            return
+        if ptq_args.save_svd_model == True:
+            model_utils.save_model(student_model, model_args.input_model, model_args=model_args, training_args=training_args, ptq_args=ptq_args)
         
-     # Print compression stats
+    uncompressed_ppl, avg_time_per_token = eval_utils.evaluator_single_gpu_simplified(student_model, test_loader, utils.DEV, ptq_args)
+    print(f"Scaled ppl PPL after low-rank replacement: {uncompressed_ppl:.2f}")
+    if wandb.run is not None:
+        wandb.log({
+            "compressed/svd_ppl": uncompressed_ppl,
+            "compressed/avg_time_per_token": avg_time_per_token,
+        })
+        
+    # Print compression stats
     compressed_stats = get_compression_stats(student_model)
     print(f"\nCompression Statistics:")
     print(f"  Total parameters original: {uncompressed_stats['total_params']:,}")
@@ -245,67 +296,7 @@ def process():
     print(f"  Low-rank parameters: {compressed_stats['lowrank_params']:,}")
     compression_ratio = compressed_stats['total_params'] / uncompressed_stats['total_params']
     print(f"  Compression ratio: {compression_ratio:.2%}")
-    
-    # # eval
-    # compressed_ppl, avg_time_per_token = eval_utils.evaluator(student_model, testloader, utils.DEV, ptq_args) 
-    # print(f"Student model PPL after low-rank replacement: {compressed_ppl:.2f}, Avg time per token: {avg_time_per_token*1000:.2f} ms")
-    # wandb.log({
-    #     "baseline/uncompressed_ppl": uncompressed_ppl,
-    #     "baseline/compressed_ppl": compressed_ppl,
-    #     "baseline/compression_ratio": compression_ratio
-    # })
-    
-    # First, see what Linear modules are available
-    # print("\nAvailable Linear modules:")
-    # all_linear_modules = get_all_linear_module_names(student_model)
-    # for name in all_linear_modules[:10]:  # Show first 10
-    #     print(f"  - {name}")
-    # if len(all_linear_modules) > 10:
-    #     print(f"  ... and {len(all_linear_modules) - 10} more")
-    
-    # # Defines which modules to replace
-    # layer_id = list(range(0, 32))
-    # target_modules = [i for i in all_linear_modules for j in layer_id if f"model.layers.{j}." in i]
-    
-    # # Do the replacement
-    # replace_linear_with_lowrank(
-    #     student_model, 
-    #     rank_modifier=rank_modifier,
-    #     target_modules=target_modules,
-    #     init_with_svd=True
-    # )
-    
-   
-    
-    teacher_model = AutoModelForCausalLM.from_pretrained(
-        "meta-llama/Llama-3.1-8B",
-        device_map="auto",
-        token=model_args.access_token,
-    )
-    
-    tokenizer = AutoTokenizer.from_pretrained(
-            pretrained_model_name_or_path=model_args.input_model,
-            cache_dir=training_args.cache_dir,
-            model_max_length=training_args.model_max_length,
-            padding_side="right",
-            use_fast=True,
-            add_eos_token=False,
-            add_bos_token=False,
-            token=model_args.access_token,
-        )
-    test_loader = data_utils.get_wikitext2(
-            seed=ptq_args.seed,
-            seqlen=256,
-            tokenizer=tokenizer,
-            eval_mode=True,
-        )
-    train_loader = data_utils.get_wikitext2(
-            seed=ptq_args.seed,
-            nsamples=ptq_args.train_loader_nsamples,
-            seqlen=ptq_args.train_loader_seqlen,
-            tokenizer=tokenizer,
-            eval_mode=False,
-        )
+    torch.cuda.empty_cache()
     
     # Knowledge Distillation Training
     config = DistillationConfig(
@@ -320,12 +311,25 @@ def process():
     # Initialize distiller
     print(f"Using distillation: {ptq_args.use_distillation}")
     distiller = KnowledgeDistiller(student_model, teacher_model, tokenizer, config)
-    distiller.train(train_loader, test_loader, ptq_args)
-    distiller.save_student_model("./distilled_llama_student")
+    if ptq_args.fine_tune_after_compression == True:
+        distiller.train(train_loader, test_loader, ptq_args)
+    # distiller.save_student_model("./distilled_llama_student")
+    
+    # cleanup torch memory
+    del student_model
+    del teacher_model
+    del distiller
+    del test_loader
+    del train_loader
+    del tokenizer
+    memory_cleanup()
+    print("finished run :3")
 
 
 def main():
-    dist.init_process_group(backend="nccl", timeout=datetime.timedelta(hours=8))
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        dist.init_process_group(backend="nccl", timeout=datetime.timedelta(hours=8))
+        
     print(sys.argv)
     load_dotenv('.env')
     if "--wandb_sweep" in sys.argv:
@@ -336,7 +340,35 @@ def main():
         wandb_utils.start_run("lowrank_replacement_test", None, process)
     else:
         process()
-    dist.destroy_process_group()
+    
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        dist.destroy_process_group()
+
+def find_cuda_tensors():
+    for obj in gc.get_objects():
+        try:
+            if torch.is_tensor(obj) and obj.is_cuda:
+                print(type(obj), obj.size(), obj.device, f"{obj.element_size() * obj.nelement() / 1024**2:.2f} MB")
+                
+                # Find what refers to this tensor
+                referrers = gc.get_referrers(obj)
+                for ref in referrers:
+                    if isinstance(ref, dict):
+                        # Check if it's a __dict__ of some object (class/instance variables)
+                        for k, v in ref.items():
+                            if v is obj:
+                                print(f"  -> dict key: '{k}'")
+                        # Try to find which object owns this __dict__
+                        owners = gc.get_referrers(ref)
+                        for owner in owners:
+                            if hasattr(owner, '__dict__') and owner.__dict__ is ref:
+                                print(f"     owned by: {type(owner).__name__} instance")
+                    elif isinstance(ref, list):
+                        print(f"  -> inside a list (len={len(ref)})")
+                    elif hasattr(ref, '__name__'):
+                        print(f"  -> frame/function: {ref.__name__}")
+        except Exception:
+            pass
 
 # Example usage for student-teacher training
 if __name__ == "__main__":

@@ -19,7 +19,7 @@ from utils.hadamard_utils import (
 )
 from utils.utils import HadamardTransform
 import matplotlib.pyplot as plt
-from modules.linears import SVDLinear, SVDLinear_Smoothed
+from modules.linears import SVDLinear
 OUTPUT_DIR = "output_dir/low_rank_analysis/singular_values"
 
 def plot_series(data_series, title, xlabel, ylabel, output_name):
@@ -228,6 +228,7 @@ def binary_search_truncation_rank(model, sensitivity_dict, calib_loader, args):
     full_name_dict = {module: name for name, module in model.named_modules()}
     linear_info = {}
     sensitivity_dict.pop("baseline", None)
+    sensitivity_dict.pop("lm_head", None)
     
     # DEBUG: Set args
     args.compress_kv_cache = False
@@ -360,6 +361,14 @@ def binary_search_truncation_rank(model, sensitivity_dict, calib_loader, args):
         else:
             layers_min_ratio[layername] = min(layers_min_ratio[layername], param_ratio)
             
+    if args.compress_specific_layers is not None:
+        # remove all layers from layers_min_ratio that are not in compress_specific_layers
+        layers_min_ratio = {k: v for k, v in layers_min_ratio.items() if int(k.split('.')[2]) in args.compress_specific_layers}
+    
+    if args.compress_specific_module is not None:
+        # set all layers except the specific module to default_param_ratio (no compression)
+        layers_min_ratio = {k:v for k, v in layers_min_ratio.items() if k == args.compress_specific_module}
+            
     # Apply SVD decomposition to all layers
     if args.train_low_rank_smoothing:
         activations = extract_all_layer_activations(
@@ -372,21 +381,23 @@ def binary_search_truncation_rank(model, sensitivity_dict, calib_loader, args):
         # set ratio
         raw_linear = module_dict[layername]
         info = linear_info[raw_linear]
-        layer_is_square = raw_linear.weight.shape[0] == raw_linear.weight.shape[1]
+        
         
         # Skip decomposition if using default ratio (no compression)
         if param_ratio == default_param_ratio:
             svd_linear = raw_linear
         else:
-            if args.train_low_rank_smoothing and layer_is_square:
+            if args.train_low_rank_smoothing:
                 print(f"Training low-rank smoothing for layer {layername} with param ratio {param_ratio}...")
-                svd_linear = SVDLinear_Smoothed.from_linear_with_trained_smoothing(
+                svd_linear = SVDLinear.from_linear_with_trained_smoothing(
                     raw_linear,
                     param_ratio=param_ratio,
                     calib_data=activations[layername],
                     args=args,
-                )          
-                return  # DEBUGGING TRAIN LOW RANK SMOOTH
+                )
+                # we only compress..
+                if args.compress_specific_module is not None:
+                    return
             else:
                 svd_linear = SVDLinear.from_linear(
                     raw_linear,
