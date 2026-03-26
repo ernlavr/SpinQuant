@@ -21,8 +21,6 @@ from modules.linears import LowRankLinear, SVDLinear
 import utils.wandb_utils as wandb_utils
 from dotenv import load_dotenv
 
-# 
-
 
 def decompose_weight(weight: torch.Tensor, rank: int) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -70,20 +68,32 @@ def memory_cleanup():
 
 def get_models_data_tokenizer(model_args, training_args, ptq_args):
     print(f"Loading student model from {model_args.input_model}...")
-    # student_model = model_utils.load_model("svd_llama", model_path="/eos/home-e/elavrino/git/SpinQuant/output_dir/saved_models/meta-llama_Llama-3.1-8B")
-    student_model = AutoModelForCausalLM.from_pretrained(
-        model_args.input_model,
-        device_map="auto" if torch.cuda.device_count() > 1 else "cuda",
-        token=model_args.access_token,
-        torch_dtype=torch.float32,
-        
-    )
+    model_name = "svd_qwen" if "qwen" in model_args.input_model.lower() else "svd_llama"
+    
+    student_model = None
+    try:
+        student_model = model_utils.load_model(model_name, model_path=ptq_args.compressed_model)
+        print(f"Successfully loaded compressed model from {ptq_args.compressed_model}")
+    except Exception as e:
+        print(f"Failed to load compressed model from {ptq_args.compressed_model}: {e}")
+        print("Using HuggingFace AutoModelForCausalLM...")
+        student_model = AutoModelForCausalLM.from_pretrained(
+            model_args.input_model,
+            device_map="auto" if torch.cuda.device_count() > 1 else "cuda",
+            token=model_args.access_token,
+            torch_dtype=torch.float32,  # Load in float32 for safety; can be converted later
+        )
+    finally:
+        if student_model is not None:
+            print(f"Student model loaded with {sum(p.numel() for p in student_model.parameters()):,} parameters.")
+    
     
     print(f"Loading teacher model from {model_args.input_model}...")
     teacher_model = AutoModelForCausalLM.from_pretrained(
         model_args.input_model,
         device_map="auto" if torch.cuda.device_count() > 1 else "cuda",
         token=model_args.access_token,
+        torch_dtype=torch.float32,
     )
     
     # tokenizer, data loader
@@ -103,20 +113,28 @@ def get_models_data_tokenizer(model_args, training_args, ptq_args):
             seqlen=ptq_args.test_loader_seqlen,
             nsamples=ptq_args.test_loader_nsamples,
             tokenizer=tokenizer,
-            eval_mode=True,
+            mode="eval",
         )
-    
     train_loader = data_utils.get_wikitext2(
             seed=ptq_args.seed,
             nsamples=ptq_args.train_loader_nsamples,
             seqlen=ptq_args.train_loader_seqlen,
             tokenizer=tokenizer,
-            eval_mode=False,
+            mode="train",
             bs=ptq_args.train_bs,
+        )
+    calib_loader = data_utils.get_wikitext2(
+            seed=ptq_args.seed,
+            nsamples=64,
+            seqlen=ptq_args.test_loader_seqlen,
+            tokenizer=tokenizer,
+            mode="calib",
         )
     print("Finished loading models, data, and tokenizer.")
     
-    return student_model, teacher_model, tokenizer, test_loader, train_loader
+    # serialize test_loader and train_loader to disk to avoid reloading every time to output_dir
+    
+    return student_model, teacher_model, tokenizer, test_loader, train_loader, calib_loader
 
 def replace_linear_with_lowrank(model: nn.Module, rank_modifier: float, 
                                 target_modules: Optional[list] = None,
@@ -223,10 +241,10 @@ def get_compression_stats(model: nn.Module) -> dict:
         'lowrank_params': lowrank_params,
     }
 
-def perform_binary_search_truncation(model, sensitivity_dict, train_loader, calib_loader, args):
+def perform_binary_search_truncation(model, sensitivity_dict, calib_loader, args):
     return lru.binary_search_truncation_rank(model, sensitivity_dict, calib_loader, args)
     
-def test_calib_sensitivity_ppl(model, training_args, model_args, ptq_args):
+def test_calib_sensitivity_ppl(model, training_args, test_loader, model_args, ptq_args):
     tokenizer = AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path=model_args.input_model,
             cache_dir=training_args.cache_dir,
@@ -238,14 +256,7 @@ def test_calib_sensitivity_ppl(model, training_args, model_args, ptq_args):
             token=model_args.access_token,
         )
     
-    testloader = data_utils.get_wikitext2(
-            seed=ptq_args.seed,
-            seqlen=2048,
-            tokenizer=tokenizer,
-            eval_mode=True,
-        )
-    
-    return lru.calib_sensitivity_ppl(model, testloader, ptq_args, use_cache=ptq_args.use_sensitivity_cache)
+    return lru.calib_sensitivity_ppl(model, test_loader, ptq_args, use_cache=ptq_args.use_sensitivity_cache)
     
 def process():
     memory_cleanup()
@@ -254,7 +265,7 @@ def process():
     model_args, training_args, ptq_args = process_args_ptq()
     utils.set_random_seeds(seed=ptq_args.seed)
     
-    student_model, teacher_model, tokenizer, test_loader, train_loader = get_models_data_tokenizer(model_args, training_args, ptq_args)
+    student_model, teacher_model, tokenizer, test_loader, train_loader, calib_loader = get_models_data_tokenizer(model_args, training_args, ptq_args)
     student_model.seqlen = training_args.model_max_length
     uncompressed_stats = get_compression_stats(student_model)
     print(f"Compressing student with param ratio target={ptq_args.param_ratio_target}...")    
@@ -267,26 +278,24 @@ def process():
             "uncompressed/avg_time_per_token": avg_time_per_token,
         })
     
-    sensitivity = test_calib_sensitivity_ppl(student_model, training_args, model_args, ptq_args)
+    sensitivity = test_calib_sensitivity_ppl(student_model, training_args, test_loader,model_args, ptq_args)
     # if single gpu put on cuda
     if torch.cuda.is_available() and torch.cuda.device_count() == 1:
         student_model.to(device)
     
-    if sensitivity is not None:
-        perform_binary_search_truncation(student_model, sensitivity, train_loader, test_loader, ptq_args)     
-        torch.cuda.empty_cache()  
-        if ptq_args.compress_specific_module is not None:
-            return
+    if sensitivity is not None and ptq_args.apply_svd_smoothing == True:
+        perform_binary_search_truncation(student_model, sensitivity, calib_loader, ptq_args)     
+        torch.cuda.empty_cache()
         if ptq_args.save_svd_model == True:
             model_utils.save_model(student_model, model_args.input_model, model_args=model_args, training_args=training_args, ptq_args=ptq_args)
         
-    uncompressed_ppl, avg_time_per_token = eval_utils.evaluator_single_gpu_simplified(student_model, test_loader, utils.DEV, ptq_args)
-    print(f"Scaled ppl PPL after low-rank replacement: {uncompressed_ppl:.2f}")
-    if wandb.run is not None:
-        wandb.log({
-            "compressed/svd_ppl": uncompressed_ppl,
-            "compressed/avg_time_per_token": avg_time_per_token,
-        })
+        compressed_ppl, avg_time_per_token = eval_utils.evaluator_single_gpu_simplified(student_model, test_loader, utils.DEV, ptq_args)
+        print(f"Scaled ppl PPL after low-rank replacement: {compressed_ppl:.2f}")
+        if wandb.run is not None:
+            wandb.log({
+                "compressed/svd_ppl": compressed_ppl,
+                "compressed/avg_time_per_token": avg_time_per_token,
+            })
         
     # Print compression stats
     compressed_stats = get_compression_stats(student_model)
@@ -327,11 +336,19 @@ def process():
 
 
 def main():
+    load_dotenv('/shared/elavrin/SpinQuant/.env')
+    
+    # print env variables to verify they are loaded
+    print(f"HF_HOME: {os.getenv('HF_HOME')}")
+    print(f"HF_HUB_CACHE: {os.getenv('HF_HUB_CACHE')}")
+    print(f"WANDB_API_KEY: {os.getenv('WANDB_API_KEY')}")
+    print(f"HF_TOKEN: {os.getenv('HF_TOKEN')}")
+    
     if torch.cuda.is_available() and torch.cuda.device_count() > 1:
         dist.init_process_group(backend="nccl", timeout=datetime.timedelta(hours=8))
         
     print(sys.argv)
-    load_dotenv('.env')
+    
     if "--wandb_sweep" in sys.argv:
         # wandb_sweep is a parameter which has path to sweep config json file
         config_path = sys.argv[sys.argv.index("--wandb_sweep") + 1]

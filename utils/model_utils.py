@@ -102,7 +102,7 @@ def save_model(model, model_name, checkpoint=None, **kwargs):
     and reconstructs the same SVDLinear topology before state-dict loading, so
     HuggingFace finds matching keys everywhere.
     """
-    from modules.linears import SVDLinear, SVDLlamaConfig
+    from modules.linears import SVDLinear, SVDLlamaConfig, SVDQwenConfig
 
     wandb_run_id = None if wandb.run is None else wandb.run.id
     wandb_sweep_id = None if wandb.run is None else wandb.run.sweep_id
@@ -126,11 +126,17 @@ def save_model(model, model_name, checkpoint=None, **kwargs):
 
     if svd_layers_config:
         print(f"Saving {len(svd_layers_config)} SVD-compressed layer(s) "
-              f"with SVDLlamaConfig.")
+              f"with SVDConfig.")
         config_dict = model.config.to_dict()
         config_dict.pop("model_type", None)
         config_dict["svd_layers_config"] = svd_layers_config
-        save_config = SVDLlamaConfig(**config_dict)
+        
+        if model.config.model_type == "qwen":
+            print("Detected Qwen model, using SVDQwenConfig.")
+            save_config = SVDQwenConfig(**config_dict)
+        elif model.config.model_type == "llama":
+            print("Detected LLaMA model, using SVDLlamaConfig.")
+            save_config = SVDLlamaConfig(**config_dict)
     else:
         save_config = model.config
 

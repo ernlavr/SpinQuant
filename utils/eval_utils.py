@@ -18,6 +18,17 @@ import torch
 import torch.cuda
 import time
 from tqdm import tqdm
+import argparse
+import numpy as np
+import math
+import random
+from pathlib import Path
+import gc
+import json
+from datetime import datetime
+import logging
+import lm_eval
+from modules.lm_eval_wrappers import MyCustomLM
 
 from utils import model_utils
 
@@ -711,3 +722,290 @@ def evaluator_single_gpu_simplified(model, testenc, dev, args):
     print(f"Average Time per Token: {avg_time_per_token:.4f} ms/token")
     torch.cuda.empty_cache()
     return avg_ppl, avg_time_per_token
+
+
+
+
+# ---------------------------------------------------------------------------
+# Core runner (original)
+# ---------------------------------------------------------------------------
+
+def run_evals(model, eval_tasks, device, batch_size=16):
+    results = {}
+    for task in eval_tasks:
+        print(f"Evaluating on {task}...")
+        try:
+            task_results = lm_eval.evaluate(model, task, device=device, batch_size=batch_size)
+            results[task] = task_results
+        except Exception as e:
+            print(f"Error evaluating {task}: {e}")
+            results[task] = {"error": str(e)}
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Shared helper
+# ---------------------------------------------------------------------------
+
+def _evaluate_task(model, task_name, device, batch_size=16, num_fewshot=0, limit=None, extra_kwargs=None):
+    """
+    Thin wrapper around lm_eval.simple_evaluate (harness v0.4+).
+    Falls back to lm_eval.evaluate for older harness versions.
+    Returns the per-task metrics dict.
+
+    Parameters
+    ----------
+    limit : int or float or None
+        Cap the number of samples evaluated per task.
+        int   -> exact number of samples  (e.g. limit=100)
+        float -> fraction of the dataset  (e.g. limit=0.1  means 10 %)
+        None  -> use the full dataset (default)
+    """
+    kwargs = dict(
+        model=model,
+        tasks=[task_name],
+        device=device,
+        batch_size=batch_size,
+        num_fewshot=num_fewshot,
+        **({"limit": limit} if limit is not None else {}),
+        **(extra_kwargs or {}),
+    )
+    try:
+        # lm_eval >= 0.4 (EleutherAI harness)
+        output = lm_eval.simple_evaluate(**kwargs)
+        return output["results"][task_name]
+    except AttributeError as e:
+        # Older API
+        print(e)
+        return lm_eval.evaluate(model, task_name, device=device, batch_size=batch_size)
+
+
+# ---------------------------------------------------------------------------
+# OpenBookQA  (Openb.)
+# ---------------------------------------------------------------------------
+
+def eval_openbookqa(model, device, batch_size=16, num_fewshot=0, limit=None):
+    """
+    Evaluates on OpenBookQA (500 test questions, 4-way multiple-choice,
+    elementary science facts).
+
+    Key metric: acc_norm  (length-normalised accuracy, standard for this task)
+
+    Parameters
+    ----------
+    limit : int or float or None
+        Cap samples (int) or fraction of dataset (float). None = full dataset.
+
+    Returns
+    -------
+    dict with keys: acc, acc_norm, (optionally) acc_stderr, acc_norm_stderr
+    """
+    print("=== OpenBookQA ===")
+    result = _evaluate_task(
+        model, "openbookqa", device, batch_size, num_fewshot=num_fewshot, limit=limit
+    )
+    acc      = result.get("acc,none",      result.get("acc"))
+    acc_norm = result.get("acc_norm,none", result.get("acc_norm"))
+    print(f"  acc      : {acc:.4f}")
+    print(f"  acc_norm : {acc_norm:.4f}")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# ARC-Easy  (ARC_e)
+# ---------------------------------------------------------------------------
+
+def eval_arc_easy(model, device, batch_size=16, num_fewshot=0, limit=None):
+    """
+    Evaluates on ARC-Easy (2 376 test questions, 4-way multiple-choice,
+    grade-school science; the easier partition of the ARC corpus).
+
+    Key metric: acc_norm
+
+    Parameters
+    ----------
+    limit : int or float or None
+        Cap samples (int) or fraction of dataset (float). None = full dataset.
+
+    Returns
+    -------
+    dict with keys: acc, acc_norm, (optionally) stderr variants
+    """
+    print("=== ARC-Easy ===")
+    result = _evaluate_task(
+        model, "arc_easy", device, batch_size, num_fewshot=num_fewshot, limit=limit
+    )
+    acc      = result.get("acc,none",      result.get("acc"))
+    acc_norm = result.get("acc_norm,none", result.get("acc_norm"))
+    print(f"  acc      : {acc:.4f}")
+    print(f"  acc_norm : {acc_norm:.4f}")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Winogrande  (WinoG.)
+# ---------------------------------------------------------------------------
+
+def eval_winogrande(model, device, batch_size=16, num_fewshot=5, limit=None):
+    """
+    Evaluates on Winogrande (1 267 test items, binary commonsense pronoun
+    resolution).  Standard protocol uses 5-shot.
+
+    Key metric: acc  (no normalisation needed - both continuations same length)
+
+    Parameters
+    ----------
+    limit : int or float or None
+        Cap samples (int) or fraction of dataset (float). None = full dataset.
+
+    Returns
+    -------
+    dict with keys: acc, (optionally) acc_stderr
+    """
+    print("=== Winogrande ===")
+    result = _evaluate_task(
+        model, "winogrande", device, batch_size, num_fewshot=num_fewshot, limit=limit
+    )
+    acc = result.get("acc,none", result.get("acc"))
+    print(f"  acc : {acc:.4f}")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# HellaSwag  (HellaS.)
+# ---------------------------------------------------------------------------
+
+def eval_hellaswag(model, device, batch_size=16, num_fewshot=10, limit=None):
+    """
+    Evaluates on HellaSwag (10 042 validation items, 4-way sentence completion
+    for activity descriptions).  Standard protocol uses 10-shot.
+
+    Key metric: acc_norm  (length-normalised, strongly preferred here because
+    the wrong continuations are adversarially length-matched)
+
+    Parameters
+    ----------
+    limit : int or float or None
+        Cap samples (int) or fraction of dataset (float). None = full dataset.
+
+    Returns
+    -------
+    dict with keys: acc, acc_norm, (optionally) stderr variants
+    """
+    print("=== HellaSwag ===")
+    result = _evaluate_task(
+        model, "hellaswag", device, batch_size, num_fewshot=num_fewshot, limit=limit
+    )
+    acc      = result.get("acc,none",      result.get("acc"))
+    acc_norm = result.get("acc_norm,none", result.get("acc_norm"))
+    print(f"  acc      : {acc:.4f}")
+    print(f"  acc_norm : {acc_norm:.4f}")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# PIQA
+# ---------------------------------------------------------------------------
+
+def eval_piqa(model, device, batch_size=16, num_fewshot=0, limit=None):
+    """
+    Evaluates on PIQA (1 838 test items, binary physical intuition QA).
+
+    Key metric: acc_norm
+
+    Parameters
+    ----------
+    limit : int or float or None
+        Cap samples (int) or fraction of dataset (float). None = full dataset.
+
+    Returns
+    -------
+    dict with keys: acc, acc_norm, (optionally) stderr variants
+    """
+    print("=== PIQA ===")
+    result = _evaluate_task(
+        model, "piqa", device, batch_size, num_fewshot=num_fewshot, limit=limit
+    )
+    acc      = result.get("acc,none",      result.get("acc"))
+    acc_norm = result.get("acc_norm,none", result.get("acc_norm"))
+    print(f"  acc      : {acc:.4f}")
+    print(f"  acc_norm : {acc_norm:.4f}")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# MathQA
+# ---------------------------------------------------------------------------
+
+def eval_mathqa(model, device, batch_size=16, num_fewshot=0, limit=None):
+    """
+    Evaluates on MathQA (2 985 test items, 5-way multiple-choice covering
+    arithmetic and algebraic word problems).
+
+    Key metric: acc_norm
+
+    Parameters
+    ----------
+    limit : int or float or None
+        Cap samples (int) or fraction of dataset (float). None = full dataset.
+
+    Returns
+    -------
+    dict with keys: acc, acc_norm, (optionally) stderr variants
+    """
+    print("=== MathQA ===")
+    result = _evaluate_task(
+        model, "mathqa", device, batch_size, num_fewshot=num_fewshot, limit=limit
+    )
+    acc      = result.get("acc,none",      result.get("acc"))
+    acc_norm = result.get("acc_norm,none", result.get("acc_norm"))
+    print(f"  acc      : {acc:.4f}")
+    print(f"  acc_norm : {acc_norm:.4f}")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Convenience: run all six benchmarks at once
+# ---------------------------------------------------------------------------
+
+BENCHMARK_FNS = {
+    # "openbookqa": eval_openbookqa,
+    # "arc_easy":   eval_arc_easy,
+    # "winogrande": eval_winogrande,
+    # "hellaswag":  eval_hellaswag,
+    # "piqa":       eval_piqa,
+    "mathqa":     eval_mathqa,
+}
+
+def run_standard_benchmarks(model, tokenizer, device, batch_size=32, limit=None):
+    """
+    Run all six standard benchmarks and return a consolidated results dict.
+
+    Parameters
+    ----------
+    limit : int or float or None
+        Cap samples per task for quick smoke-test runs.
+        e.g. limit=100  -> at most 100 samples per benchmark
+             limit=0.1  -> 10 % of each benchmark's test set
+             limit=None -> full datasets (default)
+
+    Returns
+    -------
+    {
+        "openbookqa": {...},
+        "arc_easy":   {...},
+        "winogrande": {...},
+        "hellaswag":  {...},
+        "piqa":       {...},
+        "mathqa":     {...},
+    }
+    """
+    lm = MyCustomLM(model=model, tokenizer=tokenizer, device=device)
+    results = {}
+    for name, fn in BENCHMARK_FNS.items():
+        try:
+            results[name] = fn(lm, device, batch_size=batch_size, limit=limit)
+        except Exception as e:
+            print(f"Error on {name}: {e}")
+            results[name] = {"error": str(e)}
+    return results

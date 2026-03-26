@@ -7,7 +7,7 @@ from typing import Dict, Optional
 
 import train_utils.svd_smoother as svd_smoother
 import utils.low_rank_utils as lru
-from transformers import AutoConfig, AutoModelForCausalLM, LlamaConfig, LlamaForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM, LlamaConfig, LlamaForCausalLM, Qwen3ForCausalLM, Qwen3Config
 
 
 # ---------------------------------------------------------------------------
@@ -27,7 +27,6 @@ class SVDLlamaConfig(LlamaConfig):
     def __init__(self, svd_layers_config: Optional[Dict[str, int]] = None, **kwargs):
         self.svd_layers_config = svd_layers_config or {}
         super().__init__(**kwargs)
-
 
 class SVDLlamaForCausalLM(LlamaForCausalLM):
     """
@@ -63,11 +62,62 @@ class SVDLlamaForCausalLM(LlamaForCausalLM):
                 torch.zeros(out_f, dtype=dtype, device=device) if has_bias else None
             )
             setattr(parent, attr, SVDLinear(L, R, bias_placeholder))
+        
+class SVDQwenConfig(Qwen3Config):
+    """
+    Extends Qwen3Config with per-layer SVD rank information.
+
+    ``svd_layers_config`` maps each replaced module's dot-separated path
+    (as returned by ``model.named_modules()``) to the truncation rank used,
+    e.g. ``{"model.layers.0.self_attn.q_proj": 64, ...}``.
+    """
+    model_type = "svd_qwen"
+
+    def __init__(self, svd_layers_config: Optional[Dict[str, int]] = None, **kwargs):
+        self.svd_layers_config = svd_layers_config or {}
+        super().__init__(**kwargs)
+        
+class SVDQwenForCausalLM(Qwen3ForCausalLM):
+    """
+    QwenForCausalLM variant that reconstructs SVDLinear modules from the
+    config on instantiation.  Used as the target class when calling
+    ``SVDQwenForCausalLM.from_pretrained(saved_dir)``.
+    """
+    config_class = SVDQwenConfig
+
+    def __init__(self, config: SVDQwenConfig):
+        super().__init__(config)
+        
+        if not config.svd_layers_config:
+            return
+
+        # Build a flat {path: module} map once — O(N) instead of O(N * depth)
+        module_map = {name: mod for name, mod in self.named_modules()}
+
+        for module_path, rank in config.svd_layers_config.items():
+            parts = module_path.rsplit(".", 1)
+            parent_path, attr = (parts[0], parts[1]) if len(parts) == 2 else ("", parts[0])
+            parent = module_map[parent_path] if parent_path else self
+            
+            original = getattr(parent, attr)
+            out_f, in_f = original.weight.shape
+            has_bias = original.bias is not None
+            dtype = original.weight.dtype
+            device = original.weight.device  # 'meta' during from_pretrained
+
+            L = torch.zeros(out_f, rank, dtype=dtype, device=device)
+            R = torch.zeros(rank, in_f, dtype=dtype, device=device)
+            bias_placeholder = (
+                torch.zeros(out_f, dtype=dtype, device=device) if has_bias else None
+            )
+            setattr(parent, attr, SVDLinear(L, R, bias_placeholder))
 
 
 # Register so that AutoConfig / AutoModelForCausalLM work transparently.
 AutoConfig.register("svd_llama", SVDLlamaConfig)
+AutoConfig.register("svd_qwen", SVDQwenConfig)
 AutoModelForCausalLM.register(SVDLlamaConfig, SVDLlamaForCausalLM)
+AutoModelForCausalLM.register(SVDQwenConfig, SVDQwenForCausalLM)
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +251,7 @@ class SVDLinear(nn.Module):
         param_ratio: float,
         rank_align: int = 1,
         calib_data: Optional[torch.Tensor] = None,
+        layer_name: Optional[str] = None,
         args=None,
     ) -> "SVDLinear":
         """Gradient-train L and R to minimise reconstruction loss on calib_data."""
@@ -214,13 +265,13 @@ class SVDLinear(nn.Module):
         if args.train_svd_scalers_sequentially:
             print(f"Training SVD scalers sequentially for layer with param ratio {param_ratio}...")
             L, R, _loss_history = svd_smoother.train_svd_scalers_sequentially(
-                linear.weight.data.float(), calib_data, rank, args,
+                linear.weight.data, calib_data, rank, args, layername=layer_name,
                 num_epochs=num_epochs, lr=1e-4,
             )
         else:
             print(f"Training SVD scalers jointly for layer with param ratio {param_ratio}...")
-            L, R, _loss_history = svd_smoother.train_svd_compressor(
-                linear.weight.data.float(), calib_data, rank, args,
+            L, R, _loss_history = svd_smoother.train_svd_scalers_simultaneously(
+                linear.weight.data, calib_data, rank, args, layername=layer_name,
                 num_epochs=num_epochs, lr=1e-4,
             )
             

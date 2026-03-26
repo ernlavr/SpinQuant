@@ -420,6 +420,12 @@ def parser_gen():
         default=False,
     )
     parser.add_argument(
+        "--apply_svd_smoothing",
+        action="store_true",
+        help="Bypass creation of SVD layers, leave to false if just fine-tuning, e.g. pretrained SVD layers",
+        default=False,
+    )
+    parser.add_argument(
         "--train_low_rank_smoothing",
         action="store_true",
         help="Train a smoothing function for better low-rank decomposition",
@@ -530,6 +536,13 @@ def parser_gen():
         type=json.loads,
         default=None,
         help="Define a list of layers to apply compression to in format [0, 1, 2, 3, 4] or None to apply to all layers",
+    )
+    
+    parser.add_argument(
+        "--compressed_model",
+        type=str,
+        default=None,
+        help="Name or path of the model which will be compressed",
     )
     
     parser.add_argument(

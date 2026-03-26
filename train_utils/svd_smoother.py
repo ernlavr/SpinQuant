@@ -265,7 +265,7 @@ def train_svd_compressor_alternating_optimization(W, X, rank, args, num_epochs=4
         loss_history: List of loss values during training
     """
 
-def train_svd_compressor(W, X, rank, args, num_epochs=40, lr=1e-2, device=None):
+def train_svd_compressor(W, X, rank, args, num_epochs=40, lr=1e-2, layername=None, device=None):
     """
     Optimize weight compression using learnable singular value scaling.
     
@@ -289,6 +289,7 @@ def train_svd_compressor(W, X, rank, args, num_epochs=40, lr=1e-2, device=None):
     
     W = W.to(device)
     X = X.to(device)
+    # squeeze out single dimnesions
     batch, tokens, d_in = X.shape
     X = X.reshape(-1, d_in)
     
@@ -474,24 +475,24 @@ def train_svd_compressor(W, X, rank, args, num_epochs=40, lr=1e-2, device=None):
         # log loss, entropy, participation, mean+std of smooth operator
         if wandb.run is not None:
             log_dict = {
-                "loss": loss.item(),
+                f"{layername}/loss": loss.item(),
                 "learning_rate": scheduler.get_last_lr()[0] if scheduler is not None else lr,
             }
             
             if add_term_to_loss is not None:
-                log_dict["loss_with_term"] = loss_w_term.item()
+                log_dict[f"{layername}/loss_with_term"] = loss_w_term.item()
             
             if num_sanitized is not None:
-                log_dict["num_sanitized"] = num_sanitized
+                log_dict[f"{layername}/num_sanitized"] = num_sanitized
                 
             if entropy is not None:
-                log_dict["entropy"] = entropy.item()
+                log_dict[f"{layername}/entropy"] = entropy.item()
             
             if participation is not None:
-                log_dict["participation"] = participation.item()
+                log_dict[f"{layername}/participation"] = participation.item()
             
             if loss_w_term is not None:
-                log_dict["loss_with_term"] = loss_w_term.item()
+                log_dict[f"{layername}/loss_with_term"] = loss_w_term.item()
 
             wandb.log(log_dict)
         
@@ -824,7 +825,7 @@ def _init_parameters_and_baseline(W, X, rank, args, device):
     """
     W = W.to(device)
     X = X.to(device)
-
+    X = X.squeeze()
     batch, tokens, d_in = X.shape
     X = X.reshape(-1, d_in)
 
@@ -893,7 +894,7 @@ def _build_LR(W, rank, d_r, d_c, scaling):
     return L, R
 
 
-def train_svd_scalers_simultaneously(W, X, rank, args, num_epochs=40, lr=1e-2, device=None):
+def train_svd_scalers_simultaneously(W, X, rank, args, num_epochs=40, lr=1e-2, layername=None, device=None):
     """
     Optimize weight compression using learnable singular value scaling.
     Trains d_r and d_c **simultaneously** to minimise reconstruction error on X.
@@ -933,7 +934,7 @@ def train_svd_scalers_simultaneously(W, X, rank, args, num_epochs=40, lr=1e-2, d
         scaling=scaling,
         num_epochs=num_epochs,
         lr=lr,
-        phase_name="simultaneous",
+        phase_name=layername,
     )
 
     with torch.no_grad():
@@ -945,7 +946,7 @@ def train_svd_scalers_simultaneously(W, X, rank, args, num_epochs=40, lr=1e-2, d
     return L, R, loss_history
 
 
-def train_svd_scalers_sequentially(W, X, rank, args, num_epochs=40, lr=1e-2, device=None):
+def train_svd_scalers_sequentially(W, X, rank, args, num_epochs=40, lr=1e-2, layername=None, device=None):
     """
     Alternate optimization of low-rank factors for weight compression.
 

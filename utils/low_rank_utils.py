@@ -230,6 +230,14 @@ def binary_search_truncation_rank(model, sensitivity_dict, calib_loader, args):
     sensitivity_dict.pop("baseline", None)
     sensitivity_dict.pop("lm_head", None)
     
+    if args.compress_specific_layers is not None:
+        # remove all layers from layers_min_ratio that are not in compress_specific_layers
+        sensitivity_dict = {k: v for k, v in sensitivity_dict.items() if int(k.split('.')[2]) in args.compress_specific_layers}
+    
+    if args.compress_specific_module is not None:
+        # set all layers except the specific module to default_param_ratio (no compression)
+        sensitivity_dict = {k:v for k, v in sensitivity_dict.items() if args.compress_specific_module in k}
+    
     # DEBUG: Set args
     args.compress_kv_cache = False
     args.ppl_target = 0
@@ -361,18 +369,10 @@ def binary_search_truncation_rank(model, sensitivity_dict, calib_loader, args):
         else:
             layers_min_ratio[layername] = min(layers_min_ratio[layername], param_ratio)
             
-    if args.compress_specific_layers is not None:
-        # remove all layers from layers_min_ratio that are not in compress_specific_layers
-        layers_min_ratio = {k: v for k, v in layers_min_ratio.items() if int(k.split('.')[2]) in args.compress_specific_layers}
-    
-    if args.compress_specific_module is not None:
-        # set all layers except the specific module to default_param_ratio (no compression)
-        layers_min_ratio = {k:v for k, v in layers_min_ratio.items() if k == args.compress_specific_module}
-            
     # Apply SVD decomposition to all layers
     if args.train_low_rank_smoothing:
         activations = extract_all_layer_activations(
-                        model, calib_loader, list(layers_min_ratio.keys()), max_batches=1
+                        model, calib_loader, list(layers_min_ratio.keys())
                     )
         
         
@@ -393,6 +393,7 @@ def binary_search_truncation_rank(model, sensitivity_dict, calib_loader, args):
                     raw_linear,
                     param_ratio=param_ratio,
                     calib_data=activations[layername],
+                    layer_name=layername,
                     args=args,
                 )
                 # we only compress..
@@ -580,7 +581,7 @@ def extract_layer_activations(
 
 def extract_all_layer_activations(
     model: nn.Module,
-    test_loader: DataLoader,
+    calib_loader: DataLoader,
     layer_names: list,
     max_batches: Optional[int] = None,
     device: str = "cuda",
@@ -591,7 +592,7 @@ def extract_all_layer_activations(
     
     Args:
         model: The full model
-        test_loader: DataLoader with calibration data
+        calib_loader: DataLoader with calibration data
         layer_names: List of (layer_name, layer_module) tuples or dict
         max_batches: Max batches to process
         device: Device to run on
@@ -625,13 +626,10 @@ def extract_all_layer_activations(
     try:
         with torch.no_grad():
             
-            for idx, batch in tqdm(enumerate(test_loader), desc="Extracting Activations", unit="batch"):
+            for idx, batch in tqdm(enumerate(calib_loader), desc="Extracting Activations", unit="batch"):
                 batch_size = batch[0].shape[0] if isinstance(batch, (list, tuple)) else batch.shape[0]
                 batch_inputs = batch
                 _ = model(batch_inputs.to(device))
-                
-                if idx >= max_batches:
-                    break
     
     finally:
         # Always remove hooks

@@ -27,11 +27,13 @@ class TupleDataset(torch.utils.data.Dataset):
         return self.data[idx]
     
 
-def get_wikitext2(nsamples=128, seed=0, seqlen=2048, model="", tokenizer=None, eval_mode=False, bs=4):
+def get_wikitext2(nsamples=128, seed=0, seqlen=2048, model="", tokenizer=None, mode=None, bs=4):
+    print(f"Getting Wikitext-2 dataset with nsamples={nsamples}, seed={seed}, seqlen={seqlen}, model={model}, mode={mode}, bs={bs}")
+    
     if tokenizer is None:
         tokenizer = transformers.AutoTokenizer.from_pretrained(model, use_fast=False)
 
-    if eval_mode:
+    if mode == "eval":
         testdata = datasets.load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1")[
             "test"
         ]
@@ -41,6 +43,12 @@ def get_wikitext2(nsamples=128, seed=0, seqlen=2048, model="", tokenizer=None, e
         num_sequences = len(input_ids) // seqlen
         input_ids = input_ids[:num_sequences * seqlen]
         sequences = input_ids.view(num_sequences, seqlen)
+        
+        output_dir = "/shared/elavrin/SpinQuant/output_dir/data"
+        os.makedirs(output_dir, exist_ok=True)
+        torch.save(sequences, os.path.join(output_dir, "test_sequences.pt"))
+        print(f"Saved test sequences {output_dir}")
+        
         dataloader = torch.utils.data.DataLoader(
             sequences,
             batch_size=bs,
@@ -48,7 +56,7 @@ def get_wikitext2(nsamples=128, seed=0, seqlen=2048, model="", tokenizer=None, e
         )
         
         return dataloader
-    else:
+    elif mode == "train":
         traindata = datasets.load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1")[
             "train"
         ]
@@ -63,6 +71,10 @@ def get_wikitext2(nsamples=128, seed=0, seqlen=2048, model="", tokenizer=None, e
             tar[:, :-1] = -100
             trainloader.append((inp, tar))
             
+        output_dir = "/shared/elavrin/SpinQuant/output_dir/data"
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"Saved test sequences {output_dir}")    
+            
         # create a dataloader
         trainloader = torch.utils.data.DataLoader(
             TupleDataset(trainloader), 
@@ -70,6 +82,34 @@ def get_wikitext2(nsamples=128, seed=0, seqlen=2048, model="", tokenizer=None, e
             shuffle=True,
         )
         return trainloader
+    
+    elif mode == "calib":
+        seed = seed + nsamples + seqlen  # Ensure a different seed for calibration data
+        print(f"Generating calibration data with sampling seed: {seed}")
+        calib_data = datasets.load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1")[
+            "train"
+        ]
+        calibenc = tokenizer("\n\n".join(calib_data["text"]), return_tensors="pt")
+        random.seed(seed)
+        calibloader = []
+        for _ in range(nsamples):
+            i = random.randint(0, calibenc.input_ids.shape[1] - seqlen - 1)
+            j = i + seqlen
+            inp = calibenc.input_ids[:, i:j]
+            calibloader.append(inp)
+        
+            
+        output_dir = "/shared/elavrin/SpinQuant/output_dir/data"
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"Saved test sequences {output_dir}")    
+            
+        # create a dataloader
+        calibration_data = torch.utils.data.DataLoader(
+            TupleDataset(calibloader), 
+            batch_size=bs, 
+            shuffle=True,
+        )
+        return calibration_data
 
 def get_c4(nsamples=128, seed=0, seqlen=2048, model="", tokenizer=None, eval_mode=False):
     """
