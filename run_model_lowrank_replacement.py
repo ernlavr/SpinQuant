@@ -1,3 +1,9 @@
+from dotenv import dotenv_values, load_dotenv
+load_dotenv("/shared/elavrin/SpinQuant/.env")
+config = dotenv_values("/shared/elavrin/SpinQuant/.env")
+for key, value in config.items():
+    print(f"{key}={value}")
+
 import gc
 import os
 import sys
@@ -19,7 +25,6 @@ from utils import data_utils, eval_utils, utils
 from utils.process_args import process_args_ptq
 from modules.linears import LowRankLinear, SVDLinear
 import utils.wandb_utils as wandb_utils
-from dotenv import load_dotenv
 
 
 def decompose_weight(weight: torch.Tensor, rank: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -125,7 +130,7 @@ def get_models_data_tokenizer(model_args, training_args, ptq_args):
         )
     calib_loader = data_utils.get_wikitext2(
             seed=ptq_args.seed,
-            nsamples=64,
+            nsamples=32,
             seqlen=ptq_args.test_loader_seqlen,
             tokenizer=tokenizer,
             mode="calib",
@@ -265,9 +270,24 @@ def process():
     model_args, training_args, ptq_args = process_args_ptq()
     utils.set_random_seeds(seed=ptq_args.seed)
     
+    # HF cache debug
+    from huggingface_hub import constants
+    print(constants.HF_HOME)
+    print(constants.HF_HUB_CACHE)
+    
+    # print these os.environ HF_HOME=/shared/elavrin/.cache/huggingface
+    print(f"HF_HOME={os.environ.get('HF_HOME')}")
+    print(f"HF_HUB_CACHE={os.environ.get('HF_HUB_CACHE')}")
+    print(f"WANDB_DIR={os.environ.get('WANDB_DIR')}")
+    print(f"TRANSFORMERS_CACHE={os.environ.get('TRANSFORMERS_CACHE')}")
+    print(f"WANDB_API_KEY={os.environ.get('WANDB_API_KEY')}")
+    print(f"HF_TOKEN={os.environ.get('HF_TOKEN')}")
+    print(f"WANDB_CACHE_DIR={os.environ.get('WANDB_CACHE_DIR')}")
+    print(f"HF_TRUST_REMOTE_CODE={os.environ.get('HF_TRUST_REMOTE_CODE')}")
+    
     student_model, teacher_model, tokenizer, test_loader, train_loader, calib_loader = get_models_data_tokenizer(model_args, training_args, ptq_args)
     student_model.seqlen = training_args.model_max_length
-    uncompressed_stats = get_compression_stats(student_model)
+    uncompressed_stats = get_compression_stats(teacher_model)
     print(f"Compressing student with param ratio target={ptq_args.param_ratio_target}...")    
         
     uncompressed_ppl, avg_time_per_token = eval_utils.evaluator_single_gpu_simplified(student_model, test_loader, utils.DEV, ptq_args) 
@@ -277,6 +297,7 @@ def process():
             "uncompressed/ppl": uncompressed_ppl,
             "uncompressed/avg_time_per_token": avg_time_per_token,
         })
+    
     
     sensitivity = test_calib_sensitivity_ppl(student_model, training_args, test_loader,model_args, ptq_args)
     # if single gpu put on cuda
@@ -313,8 +334,8 @@ def process():
         alpha=0.7,
         batch_size=4,
         learning_rate=1e-6,
-        num_epochs=5,
-        max_seq_length=256,
+        num_epochs=3,
+        max_seq_length=512,
     )
     
     # Initialize distiller
@@ -323,6 +344,9 @@ def process():
     if ptq_args.fine_tune_after_compression == True:
         distiller.train(train_loader, test_loader, ptq_args)
     # distiller.save_student_model("./distilled_llama_student")
+    
+    if ptq_args.run_all_evals == True:
+        eval_utils.run_standard_benchmarks(student_model, tokenizer, utils.DEV)
     
     # cleanup torch memory
     del student_model
@@ -336,17 +360,9 @@ def process():
 
 
 def main():
-    load_dotenv('/shared/elavrin/SpinQuant/.env')
-    
-    # print env variables to verify they are loaded
-    print(f"HF_HOME: {os.getenv('HF_HOME')}")
-    print(f"HF_HUB_CACHE: {os.getenv('HF_HUB_CACHE')}")
-    print(f"WANDB_API_KEY: {os.getenv('WANDB_API_KEY')}")
-    print(f"HF_TOKEN: {os.getenv('HF_TOKEN')}")
-    
     if torch.cuda.is_available() and torch.cuda.device_count() > 1:
         dist.init_process_group(backend="nccl", timeout=datetime.timedelta(hours=8))
-        
+    
     print(sys.argv)
     
     if "--wandb_sweep" in sys.argv:

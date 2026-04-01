@@ -19,9 +19,6 @@ class MyCustomLM(LM):
         #     self.tokenizer.pad_token = self.tokenizer.eos_token
         #     self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
-        self.model.eval()
-        self.model.to(self.device)
-
     # ------------------------------------------------------------------ #
     #  loglikelihood: P(continuation | context)                           #
     #  Input:  list of Instance with .args = (context_str, continuation_str)
@@ -47,7 +44,7 @@ class MyCustomLM(LM):
             full_ids    = self.tokenizer.encode(full_text, add_special_tokens=False)
             ctx_ids     = self.tokenizer.encode(context,   add_special_tokens=False)
             cont_ids    = full_ids[len(ctx_ids):]  # reliable boundary
-            input_ids   = torch.tensor([full_ids], ...)
+            input_ids   = torch.tensor([full_ids]).to(self.model.device)
 
             with torch.no_grad():
                 logits = self.model(input_ids, use_cache=False).logits  # (1, seq_len, vocab)

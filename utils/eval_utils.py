@@ -662,7 +662,6 @@ def evaluator_single_gpu_simplified(model, testenc, dev, args):
         avg_ppl: Average perplexity across runs
         avg_time_per_token: Average inference time per token
     """
-    model.eval()
     dev = model.device
     
     print(f"INFO: Running {args.nb_eval_runs} evaluation passes")
@@ -969,11 +968,11 @@ def eval_mathqa(model, device, batch_size=16, num_fewshot=0, limit=None):
 # ---------------------------------------------------------------------------
 
 BENCHMARK_FNS = {
-    # "openbookqa": eval_openbookqa,
-    # "arc_easy":   eval_arc_easy,
-    # "winogrande": eval_winogrande,
-    # "hellaswag":  eval_hellaswag,
-    # "piqa":       eval_piqa,
+    "openbookqa": eval_openbookqa,
+    "arc_easy":   eval_arc_easy,
+    "winogrande": eval_winogrande,
+    "hellaswag":  eval_hellaswag,
+    "piqa":       eval_piqa,
     "mathqa":     eval_mathqa,
 }
 

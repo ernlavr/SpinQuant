@@ -557,6 +557,12 @@ def parser_gen():
         default=False,
         help="Save the SVD model (U, S, V) after training the scalers",
     )
+    parser.add_argument(
+        "--run_all_evals",
+        type=bool,
+        default=False,
+        help="Run full evals",
+    )
     
     
 

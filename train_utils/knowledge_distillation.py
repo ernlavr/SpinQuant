@@ -123,14 +123,14 @@ class KnowledgeDistiller:
         # Forward pass through teacher (no grad)
         with torch.no_grad():
             teacher_outputs = self.teacher(
-                input_ids=input_ids.to(self.teacher.device),
+                input_ids=input_ids,
                 output_hidden_states=False,
             )
             teacher_logits = teacher_outputs.logits
 
         # Forward pass through student
         student_outputs = self.student(
-            input_ids=input_ids.to(self.student.device),
+            input_ids=input_ids,
             output_hidden_states=False,
         )
         student_logits = student_outputs.logits
