@@ -65,6 +65,11 @@ def decompose_weight(weight: torch.Tensor, rank: int) -> Tuple[torch.Tensor, tor
     
     return L, R
 
+def run_evals_and_cleanup(model, tokenizer, device, limit=None):
+    eval_utils.run_standard_benchmarks(model, tokenizer, device, limit=limit)
+    gc.collect()
+    torch.cuda.empty_cache()
+
 def memory_cleanup():
     print(f"Before — reserved: {torch.cuda.memory_reserved() / 1024**2:.1f} MB")
     gc.collect()
@@ -119,6 +124,7 @@ def get_models_data_tokenizer(model_args, training_args, ptq_args):
             nsamples=ptq_args.test_loader_nsamples,
             tokenizer=tokenizer,
             mode="eval",
+            bs=ptq_args.eval_bs,
         )
     train_loader = data_utils.get_wikitext2(
             seed=ptq_args.seed,
@@ -270,25 +276,12 @@ def process():
     model_args, training_args, ptq_args = process_args_ptq()
     utils.set_random_seeds(seed=ptq_args.seed)
     
-    # HF cache debug
-    from huggingface_hub import constants
-    print(constants.HF_HOME)
-    print(constants.HF_HUB_CACHE)
-    
-    # print these os.environ HF_HOME=/shared/elavrin/.cache/huggingface
-    print(f"HF_HOME={os.environ.get('HF_HOME')}")
-    print(f"HF_HUB_CACHE={os.environ.get('HF_HUB_CACHE')}")
-    print(f"WANDB_DIR={os.environ.get('WANDB_DIR')}")
-    print(f"TRANSFORMERS_CACHE={os.environ.get('TRANSFORMERS_CACHE')}")
-    print(f"WANDB_API_KEY={os.environ.get('WANDB_API_KEY')}")
-    print(f"HF_TOKEN={os.environ.get('HF_TOKEN')}")
-    print(f"WANDB_CACHE_DIR={os.environ.get('WANDB_CACHE_DIR')}")
-    print(f"HF_TRUST_REMOTE_CODE={os.environ.get('HF_TRUST_REMOTE_CODE')}")
-    
     student_model, teacher_model, tokenizer, test_loader, train_loader, calib_loader = get_models_data_tokenizer(model_args, training_args, ptq_args)
     student_model.seqlen = training_args.model_max_length
+    
     uncompressed_stats = get_compression_stats(teacher_model)
     print(f"Compressing student with param ratio target={ptq_args.param_ratio_target}...")    
+        
         
     uncompressed_ppl, avg_time_per_token = eval_utils.evaluator_single_gpu_simplified(student_model, test_loader, utils.DEV, ptq_args) 
     print(f"Uncompressed PPL before low-rank replacement: {uncompressed_ppl:.2f}")
@@ -332,7 +325,7 @@ def process():
     config = DistillationConfig(
         temperature=1.0,
         alpha=0.7,
-        batch_size=4,
+        batch_size=2,
         learning_rate=1e-6,
         num_epochs=3,
         max_seq_length=512,
@@ -343,17 +336,22 @@ def process():
     distiller = KnowledgeDistiller(student_model, teacher_model, tokenizer, config)
     if ptq_args.fine_tune_after_compression == True:
         distiller.train(train_loader, test_loader, ptq_args)
-    # distiller.save_student_model("./distilled_llama_student")
+        # ← free distiller BEFORE evals so its optimizer states,
+    del distiller
+    del train_loader
+    del calib_loader
+    gc.collect()
+    torch.cuda.empty_cache()
+    
     
     if ptq_args.run_all_evals == True:
-        eval_utils.run_standard_benchmarks(student_model, tokenizer, utils.DEV)
+        run_evals_and_cleanup(student_model, tokenizer, utils.DEV)
     
     # cleanup torch memory
     del student_model
     del teacher_model
-    del distiller
+    
     del test_loader
-    del train_loader
     del tokenizer
     memory_cleanup()
     print("finished run :3")

@@ -12,11 +12,11 @@ import torch
 from tqdm import tqdm
 
 from utils import eval_utils, monkeypatch, quant_utils, utils
-from utils.hadamard_utils import (
-    apply_exact_had_to_linear,
-    is_pow2,
-    random_hadamard_matrix,
-)
+# from utils.hadamard_utils import (
+#     apply_exact_had_to_linear,
+#     is_pow2,
+#     random_hadamard_matrix,
+# )
 from utils.utils import HadamardTransform
 import matplotlib.pyplot as plt
 from modules.linears import SVDLinear
@@ -144,14 +144,18 @@ def decompose_ov_proj(layer, head_num, head_dim, R2=None):
 @torch.no_grad()
 def calib_sensitivity_ppl(model, calib_loader, args, use_cache=None):
     model_id = model.config._name_or_path
-    cache_dir = '/eos/home-e/elavrino/git/SpinQuant/output_dir/low_rank_analysis/cache'
-    cache_file = f"{cache_dir}/{model_id.replace('/','_')}_calib_sensitivity_ppl.pt"
-    os.makedirs(cache_dir, exist_ok=True)
+    
     if use_cache is not None and os.path.exists(use_cache):
         sensitivity_dict = torch.load(use_cache, map_location="cpu")
         print(f"Loaded sensitivity results from cache: {use_cache}")
         return sensitivity_dict
     
+    # get this file absolute path
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    parent_dir = os.path.dirname(current_dir)
+    cache_dir = os.path.join(parent_dir, "output") + "low_rank_analysis/cache"
+    cache_file = f"{cache_dir}/{model_id.replace('/','_')}_calib_sensitivity_ppl.pt"
+    os.makedirs(cache_dir, exist_ok=True)
     model.eval()
 
     full_name_dict = {module: name for name, module in model.named_modules()}

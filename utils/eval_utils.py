@@ -29,6 +29,8 @@ from datetime import datetime
 import logging
 import lm_eval
 from modules.lm_eval_wrappers import MyCustomLM
+import datasets
+import sys
 
 from utils import model_utils
 
@@ -772,7 +774,13 @@ def _evaluate_task(model, task_name, device, batch_size=16, num_fewshot=0, limit
     try:
         # lm_eval >= 0.4 (EleutherAI harness)
         output = lm_eval.simple_evaluate(**kwargs)
-        return output["results"][task_name]
+        result = output["results"][task_name]
+        
+        # destroy the full output dict immediately — it holds internal model refs
+        del output
+        gc.collect()
+        torch.cuda.empty_cache()
+        return result
     except AttributeError as e:
         # Older API
         print(e)
@@ -971,9 +979,9 @@ BENCHMARK_FNS = {
     "openbookqa": eval_openbookqa,
     "arc_easy":   eval_arc_easy,
     "winogrande": eval_winogrande,
-    "hellaswag":  eval_hellaswag,
     "piqa":       eval_piqa,
-    "mathqa":     eval_mathqa,
+    "hellaswag":  eval_hellaswag,
+    # "mathqa":     eval_mathqa,
 }
 
 def run_standard_benchmarks(model, tokenizer, device, batch_size=32, limit=None):
@@ -1006,5 +1014,8 @@ def run_standard_benchmarks(model, tokenizer, device, batch_size=32, limit=None)
             results[name] = fn(lm, device, batch_size=batch_size, limit=limit)
         except Exception as e:
             print(f"Error on {name}: {e}")
-            results[name] = {"error": str(e)}
+            results[name] = {"error": str(e)}    
+    print(results)
+    # explicitly destroy the lm wrapper before returning
+    del lm
     return results

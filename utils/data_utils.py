@@ -185,6 +185,130 @@ def get_c4(nsamples=128, seed=0, seqlen=2048, model="", tokenizer=None, eval_mod
             
         return trainloader
 
+import transformers
+import datasets
+import torch
+
+def get_alpaca(nsamples=128, seed=0, seqlen=2048, model="", tokenizer=None, mode=None, bs=4):
+    print(f"Getting Alpaca dataset with nsamples={nsamples}, seed={seed}, seqlen={seqlen}, model={model}, mode={mode}, bs={bs}")
+    
+    if tokenizer is None:
+        tokenizer = transformers.AutoTokenizer.from_pretrained(model, use_fast=False)
+    
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        
+    def process_data(example):
+        sys_prompt = example['text'].split("\n\n### Instruction")[0]
+        instruction = example['instruction']
+        
+        # Renamed from 'input' to avoid shadowing the built-in Python function
+        input_text = example['input'] 
+        
+        # Note: Chat templates handle role formatting. You might not need the 
+        # "### Instruction:" headers if your chat template already formats user/system turns.
+        content_string = f"\n\n### Instruction: \n {instruction}"
+        if input_text.strip() != "":
+            content_string += f"\n\n### Input: \n {input_text}"
+        
+        # 1. Build messages for the PROMPT ONLY
+        prompt_messages = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": content_string}
+        ]
+        
+        # 2. Build messages for the FULL CONVERSATION
+        full_messages = prompt_messages + [
+            {"role": "assistant", "content": example['output']}
+        ]
+            
+        # Apply the chat template to both
+        # add_generation_prompt=True adds the assistant header (e.g., <|im_start|>assistant\n)
+        prompt_text = tokenizer.apply_chat_template(prompt_messages, tokenize=False, add_generation_prompt=True)
+        full_text = tokenizer.apply_chat_template(full_messages, tokenize=False, add_generation_prompt=False)
+
+        return {"prompt_text": prompt_text, "full_text": full_text}
+
+    dataset = datasets.load_dataset("tatsu-lab/alpaca", split="train")
+    dataset = dataset.shuffle(seed=seed).select(range(nsamples))
+    
+    # Process the dataset
+    dataset = dataset.map(process_data, num_proc=4)
+    
+    def tokenize_function(example):
+        # Tokenize the full conversation. This is what the model actually sees.
+        full_enc = tokenizer(example["full_text"], truncation=True, max_length=seqlen)
+        input_ids = full_enc["input_ids"]
+        
+        # Tokenize JUST the prompt to find out how many tokens it takes up
+        prompt_enc = tokenizer(example["prompt_text"], truncation=True, max_length=seqlen)
+        prompt_len = len(prompt_enc["input_ids"])
+        
+        # Mask the prompt with -100, but use the real input_ids for the response
+        labels = [-100] * prompt_len + input_ids[prompt_len:]
+        
+        # Truncate labels just in case the prompt alone exceeded seqlen
+        labels = labels[:seqlen]
+        
+        return {
+            "input_ids": input_ids, 
+            "attention_mask": full_enc["attention_mask"],
+            "labels": labels
+        }
+
+    # Tokenize the dataset
+    dataset = dataset.map(tokenize_function, num_proc=4)
+    dataset = dataset.remove_columns(["instruction", "input", "output", "text", "prompt_text", "full_text"])
+    
+    # Data collator handles the padding natively
+    collator = transformers.DataCollatorForSeq2Seq(
+        tokenizer,
+        return_tensors="pt",
+        padding=True,
+        label_pad_token_id=-100 
+    )
+
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=bs, collate_fn=collator)
+    return dataloader
+
+def get_train_data(args, tokenizer, mode=None):
+    if args.train_data == "wikitext2":
+        return get_wikitext2(
+            nsamples=args.train_loader_nsamples,
+            seed=args.seed,
+            seqlen=args.train_loader_seqlen,
+            tokenizer=tokenizer,
+            mode=mode,
+            bs=args.train_bs,
+        )
+    elif args.train_data == "alpaca":
+        return get_alpaca(
+            nsamples=args.train_loader_nsamples,
+            seed=args.seed,
+            seqlen=args.train_loader_seqlen,
+            tokenizer=tokenizer,
+            mode=mode,
+            bs=args.train_bs,
+        )
+        
+def get_test_data(args, tokenizer, mode=None):
+    return get_wikitext2(
+            nsamples=args.test_loader_nsamples,
+            seed=args.seed,
+            seqlen=args.test_loader_seqlen,
+            tokenizer=tokenizer,
+            mode=mode,
+            bs=args.eval_bs,
+        )
+        
+def get_calib_data(ptq_args, tokenizer):
+    return get_wikitext2(
+            seed=ptq_args.seed,
+            nsamples=32,
+            seqlen=ptq_args.test_loader_seqlen,
+            tokenizer=tokenizer,
+            mode="calib",
+        )
 
 
 class CustomJsonDataset(torch.utils.data.IterableDataset):

@@ -116,21 +116,26 @@ class KnowledgeDistiller:
                 
     def perform_training_step(self, batch, use_distillation=True):
         """Perform a single training step"""
-        input_ids = batch[0]
-        loss_mask = None # batch[1].to(self.device)
-        input_ids = input_ids.squeeze(1)
+        input_ids = None
+        try:
+            input_ids = batch[0]
+            loss_mask = None # batch[1].to(self.device)
+            input_ids = input_ids.squeeze(1)
+        except:
+            print("Error unpacking batch. Batch format may have changed.")
+            input_ids = batch['input_ids']
         
         # Forward pass through teacher (no grad)
         with torch.no_grad():
             teacher_outputs = self.teacher(
-                input_ids=input_ids,
+                input_ids=input_ids.to(self.teacher.device),
                 output_hidden_states=False,
             )
             teacher_logits = teacher_outputs.logits
 
         # Forward pass through student
         student_outputs = self.student(
-            input_ids=input_ids,
+            input_ids=input_ids.to(self.student.device),
             output_hidden_states=False,
         )
         student_logits = student_outputs.logits

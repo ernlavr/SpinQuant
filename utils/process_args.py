@@ -408,6 +408,12 @@ def parser_gen():
         help="Batch size for trainer data loader",
     )
     parser.add_argument(
+        "--eval_bs",
+        type=int,
+        default=4,
+        help="Batch size for trainer data loader",
+    )
+    parser.add_argument(
         "--param_ratio_target",
         type=float,
         default=1.0,
@@ -543,6 +549,13 @@ def parser_gen():
         type=str,
         default=None,
         help="Name or path of the model which will be compressed",
+    )
+    
+    parser.add_argument(
+        "--train_data",
+        type=str,
+        default="wikitext2",
+        help="Dataset used for fine-tuning, options: alpaca or wikitext2",
     )
     
     parser.add_argument(
