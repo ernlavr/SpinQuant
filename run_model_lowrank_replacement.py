@@ -27,6 +27,7 @@ from modules.linears import LowRankLinear, SVDLinear
 import utils.wandb_utils as wandb_utils
 
 
+
 def decompose_weight(weight: torch.Tensor, rank: int) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Decompose a weight matrix into low-rank factors using SVD.
@@ -69,6 +70,10 @@ def run_evals_and_cleanup(model, tokenizer, device, limit=None):
     eval_utils.run_standard_benchmarks(model, tokenizer, device, limit=limit)
     gc.collect()
     torch.cuda.empty_cache()
+    
+def run_subset_evals_and_cleanup(model, tokenizer, device, limit=None):
+    eval_utils.run_standard_benchmarks(model, tokenizer, device, limit=limit)
+    
 
 def memory_cleanup():
     print(f"Before — reserved: {torch.cuda.memory_reserved() / 1024**2:.1f} MB")
@@ -80,7 +85,24 @@ def get_models_data_tokenizer(model_args, training_args, ptq_args):
     print(f"Loading student model from {model_args.input_model}...")
     model_name = "svd_qwen" if "qwen" in model_args.input_model.lower() else "svd_llama"
     
+    # tokenizer, data loader
+    tokenizer = AutoTokenizer.from_pretrained(
+            pretrained_model_name_or_path=model_args.input_model,
+            cache_dir=training_args.cache_dir,
+            model_max_length=training_args.model_max_length,
+            padding_side="right",
+            use_fast=True,
+            add_eos_token=False,
+            add_bos_token=False,
+            token=model_args.access_token,
+        )
+    
+    train_loader = data_utils.get_train_data(ptq_args, tokenizer, mode="train")
+    test_loader = data_utils.get_test_data(ptq_args, tokenizer, mode="eval")
+    calib_loader = data_utils.get_calib_data(ptq_args, tokenizer)
+    
     student_model = None
+    student_model = model_utils.load_model(model_name, model_path=ptq_args.compressed_model)
     try:
         student_model = model_utils.load_model(model_name, model_path=ptq_args.compressed_model)
         print(f"Successfully loaded compressed model from {ptq_args.compressed_model}")
@@ -105,42 +127,8 @@ def get_models_data_tokenizer(model_args, training_args, ptq_args):
         token=model_args.access_token,
         torch_dtype=torch.float32,
     )
+
     
-    # tokenizer, data loader
-    tokenizer = AutoTokenizer.from_pretrained(
-            pretrained_model_name_or_path=model_args.input_model,
-            cache_dir=training_args.cache_dir,
-            model_max_length=training_args.model_max_length,
-            padding_side="right",
-            use_fast=True,
-            add_eos_token=False,
-            add_bos_token=False,
-            token=model_args.access_token,
-        )
-    
-    test_loader = data_utils.get_wikitext2(
-            seed=ptq_args.seed,
-            seqlen=ptq_args.test_loader_seqlen,
-            nsamples=ptq_args.test_loader_nsamples,
-            tokenizer=tokenizer,
-            mode="eval",
-            bs=ptq_args.eval_bs,
-        )
-    train_loader = data_utils.get_wikitext2(
-            seed=ptq_args.seed,
-            nsamples=ptq_args.train_loader_nsamples,
-            seqlen=ptq_args.train_loader_seqlen,
-            tokenizer=tokenizer,
-            mode="train",
-            bs=ptq_args.train_bs,
-        )
-    calib_loader = data_utils.get_wikitext2(
-            seed=ptq_args.seed,
-            nsamples=32,
-            seqlen=ptq_args.test_loader_seqlen,
-            tokenizer=tokenizer,
-            mode="calib",
-        )
     print("Finished loading models, data, and tokenizer.")
     
     # serialize test_loader and train_loader to disk to avoid reloading every time to output_dir
@@ -251,6 +239,21 @@ def get_compression_stats(model: nn.Module) -> dict:
         'trainable_params': trainable_params,
         'lowrank_params': lowrank_params,
     }
+    
+def configure_adapter(model):
+    adapters.init(model)
+    adapter_a_config = adapters.SeqBnConfig(
+        reduction_factor=16,   # bottleneck size = hidden/factor
+        non_linearity="gelu",                # activation inside the bottleneck
+    )
+    model.add_adapter("domain_adapter", adapter_a_config)
+    model.set_active_adapters("domain_adapter")
+    model.train_adapter("domain_adapter")
+    
+    # turn on adapter training and off all other training
+
+    
+    pass
 
 def perform_binary_search_truncation(model, sensitivity_dict, calib_loader, args):
     return lru.binary_search_truncation_rank(model, sensitivity_dict, calib_loader, args)
@@ -281,10 +284,10 @@ def process():
     
     uncompressed_stats = get_compression_stats(teacher_model)
     print(f"Compressing student with param ratio target={ptq_args.param_ratio_target}...")    
+            
         
-        
-    uncompressed_ppl, avg_time_per_token = eval_utils.evaluator_single_gpu_simplified(student_model, test_loader, utils.DEV, ptq_args) 
-    print(f"Uncompressed PPL before low-rank replacement: {uncompressed_ppl:.2f}")
+    # uncompressed_ppl, avg_time_per_token = eval_utils.evaluator_single_gpu_simplified(student_model, test_loader, utils.DEV, ptq_args) 
+    # print(f"Uncompressed PPL before low-rank replacement: {uncompressed_ppl:.2f}")
     if wandb.run is not None:
         wandb.log({
             "uncompressed/ppl": uncompressed_ppl,
@@ -324,16 +327,16 @@ def process():
     # Knowledge Distillation Training
     config = DistillationConfig(
         temperature=1.0,
-        alpha=0.7,
+        alpha=ptq_args.kd_alpha,
         batch_size=2,
         learning_rate=1e-6,
-        num_epochs=3,
+        num_epochs=ptq_args.kd_epochs,
         max_seq_length=512,
     )
     
     # Initialize distiller
     print(f"Using distillation: {ptq_args.use_distillation}")
-    distiller = KnowledgeDistiller(student_model, teacher_model, tokenizer, config)
+    distiller = KnowledgeDistiller(student_model, teacher_model, tokenizer, config, ptq_args)
     if ptq_args.fine_tune_after_compression == True:
         distiller.train(train_loader, test_loader, ptq_args)
         # ← free distiller BEFORE evals so its optimizer states,

@@ -1019,3 +1019,44 @@ def run_standard_benchmarks(model, tokenizer, device, batch_size=32, limit=None)
     # explicitly destroy the lm wrapper before returning
     del lm
     return results
+
+
+BENCHMARK_SUBSET = {
+    "openbookqa": eval_openbookqa,
+    # "arc_easy":   eval_arc_easy,
+    "winogrande": eval_winogrande,
+    "piqa":       eval_piqa,
+    # "hellaswag":  eval_hellaswag,
+    # "mathqa":     eval_mathqa,
+}
+def run_subset_benchmarks(model, tokenizer, device, batch_size=32, limit=None):
+    """
+    Run a subset of benchmarks (e.g. just OpenBookQA and ARC-Easy) for quick testing.
+
+    Parameters
+    ----------
+    limit : int or float or None
+        Cap samples per task for quick smoke-test runs.
+        e.g. limit=100  -> at most 100 samples per benchmark
+             limit=0.1  -> 10 % of each benchmark's test set
+             limit=None -> full datasets (default)
+
+    Returns
+    -------
+    {
+        "openbookqa": {...},
+        "arc_easy":   {...},
+    }
+    """
+    lm = MyCustomLM(model=model, tokenizer=tokenizer, device=device)
+    results = {}
+    for name, fn in BENCHMARK_SUBSET.items():
+        try:
+            results[name] = fn(lm, device, batch_size=batch_size, limit=limit)
+        except Exception as e:
+            print(f"Error on {name}: {e}")
+            results[name] = {"error": str(e)}    
+    print(results)
+    # explicitly destroy the lm wrapper before returning
+    del lm
+    return results

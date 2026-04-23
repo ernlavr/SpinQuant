@@ -1,3 +1,5 @@
+import gc
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,6 +13,7 @@ from tqdm import tqdm
 
 import transformers
 import wandb
+import collections.abc
 
 from utils import data_utils, eval_utils, utils
 
@@ -30,7 +33,7 @@ class DistillationConfig:
 class KnowledgeDistiller:
     """Knowledge Distillation trainer for language models"""
 
-    def __init__(self, student, teacher, tokenizer, config: DistillationConfig):
+    def __init__(self, student, teacher, tokenizer, config: DistillationConfig, ptq_args):
         self.config = config
         self.device = torch.device(config.device)
 
@@ -43,6 +46,7 @@ class KnowledgeDistiller:
         # Load student model
         self.student = student
         self.student.train()
+        self.args = ptq_args
 
         # Load tokenizer
         self.tokenizer = tokenizer
@@ -56,74 +60,70 @@ class KnowledgeDistiller:
         )
         self.scheduler = None # will be defined later
 
+    from typing import Tuple
+    import torch
+    import torch.nn.functional as F
+
     def distillation_loss(
-        self,
-        student_logits: torch.Tensor,
-        teacher_logits: torch.Tensor,
-        targets: torch.Tensor,
-        temperature: float = 4.0
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            self,
+            student_logits: torch.Tensor,
+            teacher_logits: torch.Tensor,
+            targets: torch.Tensor,
+            temperature: float = 4.0
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Calculate distillation loss
-
-        Args:
-            student_logits: Logits from student model
-            teacher_logits: Logits from teacher model
-            targets: Ground truth labels
-            temperature: Temperature for softening probabilities
-
-        Returns:
-            Tuple of (total_loss, distillation_loss, task_loss)
         """
-        # move logits to the same device which has more memory
-        more_mem_dev = self.teacher.device if torch.cuda.get_device_properties(self.teacher.device).total_memory > torch.cuda.get_device_properties(self.student.device).total_memory else self.student.device
+        # Force computations onto the student's device to avoid cross-device grad issues
+        target_device = student_logits.device
+        teacher_logits = teacher_logits.to(target_device)
+        targets = targets.to(target_device)
         
-        student_logits = student_logits.to(more_mem_dev)
-        teacher_logits = teacher_logits.to(more_mem_dev)
-        targets = targets.to(more_mem_dev)
+        # 1. Filter out ignored tokens (-100) before KL Div
+        valid_mask = targets != -100
         
-        # Distillation loss (KL divergence with temperature)
+        # SAFETY CHECK: If the entire batch is masked out, return zero losses
+        if not valid_mask.any():
+            zero_loss = torch.tensor(0.0, device=target_device, requires_grad=True)
+            return zero_loss, zero_loss.detach(), zero_loss.detach()
+
+        # Apply the mask
+        student_logits = student_logits[valid_mask]
+        teacher_logits = teacher_logits[valid_mask]
+        targets = targets[valid_mask]
+
+        # 2. Distillation loss (KL divergence with temperature)
         student_probs = F.log_softmax(student_logits / temperature, dim=-1)
         teacher_probs = F.softmax(teacher_logits / temperature, dim=-1).detach()
 
+        # Note: reduction="batchmean" mathematically acts as "mean" over the valid tokens 
+        # here since we flattened and masked our tensors. This is the correct behavior.
         kl_loss = F.kl_div(
             student_probs,
             teacher_probs,
             reduction="batchmean"
         ) * (temperature ** 2)
 
-        # Task loss (cross-entropy with ground truth)
+        # 3. Task loss (cross-entropy with ground truth)
         task_loss = F.cross_entropy(student_logits, targets)
 
         # Combined loss
-        total_loss = self.config.alpha * kl_loss + (1 - self.config.alpha) * task_loss
+        total_loss = self.args.kd_alpha * kl_loss + (1 - self.args.kd_alpha) * task_loss
 
         return total_loss, kl_loss, task_loss
-    
-    def enable_left_components(self):
-        """Enable training only for left components of SVDLinear layers"""
-        for name, param in self.student.named_parameters():
-            param.requires_grad = False
-            if "ALinear" in name:
-                param.requires_grad = True
-    
-    def enable_right_components(self):
-        """Enable training only for right components of SVDLinear layers"""
-        for name, param in self.student.named_parameters():
-            param.requires_grad = False
-            if "BLinear" in name:
-                param.requires_grad = True
-                
+
+
     def perform_training_step(self, batch, use_distillation=True):
         """Perform a single training step"""
-        input_ids = None
-        try:
-            input_ids = batch[0]
-            loss_mask = None # batch[1].to(self.device)
-            input_ids = input_ids.squeeze(1)
-        except:
-            print("Error unpacking batch. Batch format may have changed.")
+        
+        # 1. Flexible batch unpacking
+        if isinstance(batch, collections.abc.Mapping):
             input_ids = batch['input_ids']
+            labels = batch.get('labels', None)
+        else:
+            # Fallback for standard tuple datasets
+            input_ids = batch[0].squeeze(1) if batch[0].dim() > 2 else batch[0]
+            labels = batch[1] if len(batch) > 1 else None 
         
         # Forward pass through teacher (no grad)
         with torch.no_grad():
@@ -140,8 +140,19 @@ class KnowledgeDistiller:
         )
         student_logits = student_outputs.logits
 
-        # Prepare targets (shift for language modeling)
-        targets = input_ids[:, 1:].contiguous()
+        # 2. Contextual target selection & Shifting
+        # Causal LM requires shifting logits to predict the *next* token
+        if labels is not None:
+            targets = labels[:, 1:].contiguous()
+            
+            if len(targets) == 0:
+                print("Warning: Labels provided but empty after shifting. Falling back to input_ids for targets.")
+                targets = input_ids[:, 1:].contiguous()
+        else:
+            # Note: If falling back to input_ids, make sure your input_ids don't contain 
+            # padding tokens, or the model will learn to predict padding from padding!
+            targets = input_ids[:, 1:].contiguous()
+
         student_logits = student_logits[:, :-1, :].contiguous()
         teacher_logits = teacher_logits[:, :-1, :].contiguous()
 
@@ -150,6 +161,7 @@ class KnowledgeDistiller:
         student_logits_flat = student_logits.view(-1, vocab_size)
         teacher_logits_flat = teacher_logits.view(-1, vocab_size)
         targets_flat = targets.view(-1)
+        total_training_tokens = (targets_flat != -100).sum().item()
 
         # Calculate losses
         loss, kl_loss, task_loss = self.distillation_loss(
@@ -165,14 +177,13 @@ class KnowledgeDistiller:
             loss.backward()
         else:
             task_loss.backward()
+            
         torch.nn.utils.clip_grad_norm_(self.student.parameters(), max_norm=1.0)
         self.optimizer.step()            
             
-        # clear up memory
+        # Memory management: Delete large tensors, but DO NOT use empty_cache()
         del student_logits, teacher_logits, student_logits_flat, teacher_logits_flat, targets_flat
-        torch.cuda.empty_cache()
-        
-        return loss, kl_loss, task_loss
+        return loss, kl_loss, task_loss, total_training_tokens
 
     def train_epoch(self, train_loader: DataLoader, use_distillation=True, use_alternating_LR_training=False) -> dict:
         """Train for one epoch"""
@@ -187,35 +198,44 @@ class KnowledgeDistiller:
                 param.requires_grad = True
         
         total_loss = 0
-        total_kl_loss = 0
+        total_kl_loss = 0 
         total_task_loss = 0
-        num_batches = 0
+        batch_counter = 0
+        total_train_tokens = 0
+        
+        num_batches = len(train_loader)
+        evals_per_epoch = self.args.num_evals_per_epoch_zeroshot
+        eval_every = max(1, num_batches // evals_per_epoch)
 
         for batch_idx, batch in tqdm(enumerate(train_loader), f"Training with distillation: {use_distillation} ..."):
             
             if use_alternating_LR_training:
                 self.enable_left_components()
-                loss, kl_loss, task_loss = self.perform_training_step(batch, use_distillation)
+                loss, kl_loss, task_loss, training_step_tokens = self.perform_training_step(batch, use_distillation)
                 total_loss += loss.item()
                 total_kl_loss += kl_loss.item()
                 total_task_loss += task_loss.item()
-                num_batches += 1
+                total_train_tokens += training_step_tokens
+
+                batch_counter += 1
                 
                 self.enable_right_components()
-                loss, kl_loss, task_loss = self.perform_training_step(batch, use_distillation)
+                loss, kl_loss, task_loss, training_step_tokens = self.perform_training_step(batch, use_distillation)
                 total_loss += loss.item()
                 total_kl_loss += kl_loss.item()
                 total_task_loss += task_loss.item()
-                num_batches += 1
+                total_train_tokens += training_step_tokens
+                batch_counter += 1
             
             else:
                 # Perform training step
-                loss, kl_loss, task_loss = self.perform_training_step(batch, use_distillation)
+                loss, kl_loss, task_loss, training_step_tokens = self.perform_training_step(batch, use_distillation)
                 # Track metrics
                 total_loss += loss.item()
                 total_kl_loss += kl_loss.item()
                 total_task_loss += task_loss.item()
-                num_batches += 1
+                total_train_tokens += training_step_tokens
+                batch_counter += 1
             
             # Step it here to avoid stepping twice in alternating LR training
             if self.scheduler is not None:
@@ -228,25 +248,33 @@ class KnowledgeDistiller:
                     f"KL Loss: {kl_loss.item():.4f} | "
                     f"Task Loss: {task_loss.item():.4f} | "
                     f"LR: {self.scheduler.get_last_lr()[0]:.8f}"
+                    f" | Tokens: {total_train_tokens}"
                 )
                 
+            if (batch_idx + 1) % eval_every == 0:
+                eval_utils.run_subset_benchmarks(self.student, self.tokenizer, self.device, limit=100)
+                gc.collect()
+                torch.cuda.empty_cache()
+            
+            if wandb.run is not None:    
+                wandb.log({
+                    "distillation/loss": loss.item(),
+                    "distillation/kl_loss": kl_loss.item(),
+                    "distillation/task_loss": task_loss.item(),
+                    "distillation/lr": self.scheduler.get_last_lr()[0],
+                })
+            
+        if wandb.run is not None:    
             wandb.log({
-                "distillation/loss": loss.item(),
-                "distillation/kl_loss": kl_loss.item(),
-                "distillation/task_loss": task_loss.item(),
-                "distillation/lr": self.scheduler.get_last_lr()[0],
+                "distillation/epoch_avg_loss": total_loss / batch_counter,
+                "distillation/epoch_avg_kl_loss": total_kl_loss / batch_counter,
+                "distillation/epoch_avg_task_loss": total_task_loss / batch_counter,
             })
-            
-            
-        wandb.log({
-            "distillation/epoch_avg_loss": total_loss / num_batches,
-            "distillation/epoch_avg_kl_loss": total_kl_loss / num_batches,
-            "distillation/epoch_avg_task_loss": total_task_loss / num_batches,
-        })
 
-        return {"avg_loss": total_loss / num_batches,
-            "avg_kl_loss": total_kl_loss / num_batches,
-            "avg_task_loss": total_task_loss / num_batches,
+        return {"avg_loss": total_loss / batch_counter,
+            "avg_kl_loss": total_kl_loss / batch_counter,
+            "avg_task_loss": total_task_loss / batch_counter,
+            "total_train_tokens": total_train_tokens
         }
         
     def define_cos_scheduler_with_warmup(self, train_loader):
@@ -268,13 +296,14 @@ class KnowledgeDistiller:
         """Train the student model using knowledge distillation"""            
         print(f"\nStarting knowledge distillation training...")
         print(f"Temperature: {self.config.temperature}")
-        print(f"Alpha (KL weight): {self.config.alpha}")
+        print(f"Alpha (KL weight): {ptq_args.kd_alpha}")
+        print(f"KD Epochs: {ptq_args.kd_epochs}")
         self.scheduler = self.define_cos_scheduler_with_warmup(train_loader)
         # self.run_eval(self.student, test_loader, utils.DEV, ptq_args, 0)
         
-        for epoch in range(self.config.num_epochs):
+        for epoch in range(ptq_args.kd_epochs):
             print(f"\n{'='*50}")
-            print(f"Epoch {epoch + 1}/{self.config.num_epochs}")
+            print(f"Epoch {epoch + 1}/{ptq_args.kd_epochs}")
             print(f"{'='*50}")
 
             metrics = self.train_epoch(train_loader, ptq_args.use_distillation, ptq_args.use_alternating_LR_training)
@@ -283,6 +312,7 @@ class KnowledgeDistiller:
             print(f"  Average Loss: {metrics['avg_loss']:.4f}")
             print(f"  Average KL Loss: {metrics['avg_kl_loss']:.4f}")
             print(f"  Average Task Loss: {metrics['avg_task_loss']:.4f}")
+            print(f"  Total Training Tokens: {metrics['total_train_tokens']}")
             
             self.run_eval(self.student, test_loader, utils.DEV, ptq_args, epoch + 1)
             
@@ -323,3 +353,4 @@ class KnowledgeDistiller:
             )
 
         return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+    

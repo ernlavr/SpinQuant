@@ -43,6 +43,15 @@ class TrainingArguments(transformers.TrainingArguments):
             "help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)"
         },
     )
+    
+def nsamples_type(x):
+    if x.lower() == "full":
+        return "full"
+    if x.isdigit():
+        return int(x)
+    raise argparse.ArgumentTypeError(
+        "Must be a positive integer or 'full'"
+    )
 
 
 def parser_gen():
@@ -379,7 +388,7 @@ def parser_gen():
     )
     parser.add_argument(
         "--test_loader_nsamples",
-        type=int,
+        type=nsamples_type,
         default=4096,
         help="Number of samples for the test data loader",
     )
@@ -391,7 +400,7 @@ def parser_gen():
     )
     parser.add_argument(
         "--train_loader_nsamples",
-        type=int,
+        type=nsamples_type,
         default=4096,
         help="Number of samples for the training data loader",
     )
@@ -559,6 +568,27 @@ def parser_gen():
     )
     
     parser.add_argument(
+        "--kd_epochs",
+        type=int,
+        default=1,
+        help="Num epochs for KD fine tuning",
+    )
+    
+    parser.add_argument(
+        "--kd_alpha",
+        type=float,
+        default=1,
+        help="Balance between KD and task loss",
+    )
+    
+    parser.add_argument(
+        "--num_paraphrases_trainset",
+        type=int,
+        default=3,
+        help="Number of paraphrases to use for a training set if applicable (Alpaca)",
+    )
+    
+    parser.add_argument(
         "--train_svd_scalers_sequentially",
         type=bool,
         default=False,
@@ -570,11 +600,19 @@ def parser_gen():
         default=False,
         help="Save the SVD model (U, S, V) after training the scalers",
     )
+    
     parser.add_argument(
         "--run_all_evals",
         type=bool,
         default=False,
         help="Run full evals",
+    )
+    
+    parser.add_argument(
+        "--num_evals_per_epoch_zeroshot",
+        type=int,
+        default=0,
+        help="Number of evaluation runs per epoch during zero-shot evaluation with knowledge distillation (set to 0 to disable intermediate evals and only run final eval at the end of training).",
     )
     
     

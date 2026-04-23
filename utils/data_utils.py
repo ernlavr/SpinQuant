@@ -63,23 +63,31 @@ def get_wikitext2(nsamples=128, seed=0, seqlen=2048, model="", tokenizer=None, m
         trainenc = tokenizer("\n\n".join(traindata["text"]), return_tensors="pt")
         random.seed(seed)
         trainloader = []
-        for _ in range(nsamples):
-            i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
-            j = i + seqlen
-            inp = trainenc.input_ids[:, i:j]
-            tar = inp.clone()
-            tar[:, :-1] = -100
-            trainloader.append((inp, tar))
-            
+        
+        if nsamples == "full":
+        # Use full dataset sequentially
+            total_len = trainenc.input_ids.shape[1]
+            for i in range(0, total_len - seqlen, seqlen):
+                j = i + seqlen
+                inp = trainenc.input_ids[:, i:j]
+                trainloader.append(inp)
+        else:
+            # Original random sampling
+            random.seed(seed)
+            for _ in range(nsamples):
+                i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
+                j = i + seqlen
+                inp = trainenc.input_ids[:, i:j]
+                trainloader.append(inp)
+
         output_dir = "/shared/elavrin/SpinQuant/output_dir/data"
         os.makedirs(output_dir, exist_ok=True)
-        print(f"Saved test sequences {output_dir}")    
-            
-        # create a dataloader
+        print(f"Saved test sequences {output_dir}")
+
         trainloader = torch.utils.data.DataLoader(
-            TupleDataset(trainloader), 
-            batch_size=bs, 
-            shuffle=True,
+            TupleDataset(trainloader),
+            batch_size=bs,
+            shuffle=True,  # optional: no shuffle for full pass
         )
         return trainloader
     
@@ -189,6 +197,25 @@ import transformers
 import datasets
 import torch
 
+def intersect_with_cleaned_alpaca(dataset):
+    "yahma/alpaca-cleaned"
+    clean_alpaca = datasets.load_dataset("yahma/alpaca-cleaned", split="train")
+    
+    def filter_func(example, clean_instructions):
+        if example["instruction"].lower().strip() in clean_instructions:
+            return True
+        else:
+            print(f"Excluding instruction: {example['instruction']}")  # Debugging output for excluded instructions
+            return False
+
+    # select datapoints from incoming dataset which "instruction" field matches the "instruction" field in the cleaned alpaca
+    clean_instructions = set(clean_alpaca["instruction"])
+    clean_instructions = set(instr.lower().strip() for instr in clean_instructions)  # Normalize instructions for matching
+    filtered_dataset = dataset.filter(lambda x: filter_func(x, clean_instructions), desc="Filtering with cleaned Alpaca instructions")
+    return filtered_dataset
+    
+    
+
 def get_alpaca(nsamples=128, seed=0, seqlen=2048, model="", tokenizer=None, mode=None, bs=4):
     print(f"Getting Alpaca dataset with nsamples={nsamples}, seed={seed}, seqlen={seqlen}, model={model}, mode={mode}, bs={bs}")
     
@@ -230,10 +257,13 @@ def get_alpaca(nsamples=128, seed=0, seqlen=2048, model="", tokenizer=None, mode
         return {"prompt_text": prompt_text, "full_text": full_text}
 
     dataset = datasets.load_dataset("tatsu-lab/alpaca", split="train")
-    dataset = dataset.shuffle(seed=seed).select(range(nsamples))
+    dataset = intersect_with_cleaned_alpaca(dataset)  # Filter the dataset to only include instructions present in the cleaned Alpaca dataset
+    dataset = dataset.shuffle(seed=seed)
+    if nsamples != "full":
+        dataset = dataset.select(range(nsamples))
     
     # Process the dataset
-    dataset = dataset.map(process_data, num_proc=4)
+    dataset = dataset.map(process_data, num_proc=4, desc="Preparing Alpaca dataset")
     
     def tokenize_function(example):
         # Tokenize the full conversation. This is what the model actually sees.
@@ -257,7 +287,7 @@ def get_alpaca(nsamples=128, seed=0, seqlen=2048, model="", tokenizer=None, mode
         }
 
     # Tokenize the dataset
-    dataset = dataset.map(tokenize_function, num_proc=4)
+    dataset = dataset.map(tokenize_function, num_proc=4, desc="Tokenizing Alpaca dataset")
     dataset = dataset.remove_columns(["instruction", "input", "output", "text", "prompt_text", "full_text"])
     
     # Data collator handles the padding natively
@@ -270,6 +300,88 @@ def get_alpaca(nsamples=128, seed=0, seqlen=2048, model="", tokenizer=None, mode
 
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=bs, collate_fn=collator)
     return dataloader
+
+def get_alpaca_llama31(nsamples=128, seed=0, seqlen=2048, tokenizer=None, bs=4, num_paraphrases_trainset=1):
+    print(f"Getting ernlavr/Alpaca-Llama3.1-KD dataset with Llama 3.1 formatting, nsamples={nsamples}, seed={seed}, seqlen={seqlen}, num paraphrases={num_paraphrases_trainset}")
+    
+    
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    raw_ds = datasets.load_dataset("ernlavr/Alpaca-Llama3.1-KD", split="train").shuffle(seed=seed)
+    raw_ds = intersect_with_cleaned_alpaca(raw_ds)  # Filter the dataset to only include instructions present in the cleaned Alpaca dataset
+    
+    raw_ds = raw_ds.filter(
+        lambda x: x['retry_count'] < num_paraphrases_trainset,
+        desc=f"Filtering retry_count < {num_paraphrases_trainset}"
+    )
+    
+    if nsamples != "full":
+        raw_ds_selected = raw_ds.select(range(nsamples))
+        # add corresponding paraphrases for the selected samples
+        selected_ids = set(raw_ds_selected["id"])
+        raw_ds = raw_ds.filter(
+            lambda x: x['id'] in selected_ids,
+            desc=f"Selecting samples with id in {selected_ids}"
+        )
+    
+    
+    def process_data(example, tokenizer):
+        system_prompt = example['text'].split("\n\n### Instruction")[0]
+        system_prompt = tokenizer.decode(tokenizer(system_prompt)['input_ids'], skip_special_tokens=True).split("\n\n")[-1].replace(".user",".")
+        instruction = example['instruction']
+        input_text = example.get('input', '').strip()
+        output_llama = example.get('output_llama', '').strip()
+        
+        user_content = f"\n\n### Instruction: \n {instruction}"
+        if input_text != "":
+            user_content += f"\n\n### Input: \n {input_text}"
+            
+        prompt_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+        prompt_text = tokenizer.apply_chat_template(prompt_messages, tokenize=False, add_generation_prompt=True)
+        
+        full_prompt = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+            {"role": "assistant", "content": output_llama}
+        ]
+        full_prompt = tokenizer.apply_chat_template(full_prompt, tokenize=False, add_generation_prompt=False)
+        return {"prompt_text": prompt_text, "full_prompt": full_prompt}
+    
+    raw_ds = raw_ds.map(lambda x: process_data(x, tokenizer), desc="Extracting system prompts and user content")
+    
+    def tokenize(example):
+        full_enc = tokenizer(example["full_prompt"], truncation=True, max_length=seqlen)
+        input_ids = full_enc["input_ids"]
+        
+        prompt_enc = tokenizer(example["prompt_text"], truncation=True, max_length=seqlen)
+        prompt_len = len(prompt_enc["input_ids"])
+        
+        labels = [-100] * prompt_len + input_ids[prompt_len:]
+        labels = labels[:seqlen]
+        
+        return {
+            "input_ids": input_ids, 
+            "attention_mask": full_enc["attention_mask"],
+            "labels": labels
+        }        
+    
+    tokenized_ds = raw_ds.map(tokenize, desc="Tokenizing Alpaca Llama 3.1 dataset")
+    tokenized_ds = tokenized_ds.remove_columns(['id', 'retry_count', 'instruction', 'input', 'output_llama', 'output_original', 'text', 'prompt_text', 'full_prompt'])
+    
+    collator = transformers.DataCollatorForSeq2Seq(
+        tokenizer,
+        return_tensors="pt",
+        padding=True,
+        label_pad_token_id=-100
+    )
+    dataloader = torch.utils.data.DataLoader(tokenized_ds, batch_size=bs, collate_fn=collator)
+    return dataloader
+    
+    
 
 def get_train_data(args, tokenizer, mode=None):
     if args.train_data == "wikitext2":
@@ -289,6 +401,15 @@ def get_train_data(args, tokenizer, mode=None):
             tokenizer=tokenizer,
             mode=mode,
             bs=args.train_bs,
+        )
+    elif args.train_data == "ernlavr/Alpaca-Llama3.1-KD":
+        return get_alpaca_llama31(
+            nsamples=args.train_loader_nsamples,
+            seed=args.seed,
+            seqlen=args.train_loader_seqlen,
+            tokenizer=tokenizer,
+            bs=args.train_bs,
+            num_paraphrases_trainset=args.num_paraphrases_trainset
         )
         
 def get_test_data(args, tokenizer, mode=None):
