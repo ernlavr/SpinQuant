@@ -204,8 +204,10 @@ class KnowledgeDistiller:
         total_train_tokens = 0
         
         num_batches = len(train_loader)
+        eval_every = None
         evals_per_epoch = self.args.num_evals_per_epoch_zeroshot
-        eval_every = max(1, num_batches // evals_per_epoch)
+        if evals_per_epoch is not None and evals_per_epoch > 0:
+            eval_every = max(1, num_batches // evals_per_epoch)
 
         for batch_idx, batch in tqdm(enumerate(train_loader), f"Training with distillation: {use_distillation} ..."):
             
@@ -251,7 +253,7 @@ class KnowledgeDistiller:
                     f" | Tokens: {total_train_tokens}"
                 )
                 
-            if (batch_idx + 1) % eval_every == 0:
+            if eval_every is not None and (batch_idx + 1) % eval_every == 0:
                 eval_utils.run_subset_benchmarks(self.student, self.tokenizer, self.device, limit=100)
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -299,7 +301,7 @@ class KnowledgeDistiller:
         print(f"Alpha (KL weight): {ptq_args.kd_alpha}")
         print(f"KD Epochs: {ptq_args.kd_epochs}")
         self.scheduler = self.define_cos_scheduler_with_warmup(train_loader)
-        # self.run_eval(self.student, test_loader, utils.DEV, ptq_args, 0)
+        self.run_eval(self.student, test_loader, utils.DEV, ptq_args, 0)
         
         for epoch in range(ptq_args.kd_epochs):
             print(f"\n{'='*50}")
@@ -315,6 +317,7 @@ class KnowledgeDistiller:
             print(f"  Total Training Tokens: {metrics['total_train_tokens']}")
             
             self.run_eval(self.student, test_loader, utils.DEV, ptq_args, epoch + 1)
+            eval_utils.run_subset_benchmarks(self.student, self.tokenizer, self.device)
             
             if torch.cuda.device_count() > 1:
                 dist.barrier()

@@ -196,21 +196,38 @@ def get_c4(nsamples=128, seed=0, seqlen=2048, model="", tokenizer=None, eval_mod
 import transformers
 import datasets
 import torch
+import re
 
 def intersect_with_cleaned_alpaca(dataset):
-    "yahma/alpaca-cleaned"
     clean_alpaca = datasets.load_dataset("yahma/alpaca-cleaned", split="train")
     
-    def filter_func(example, clean_instructions):
-        if example["instruction"].lower().strip() in clean_instructions:
-            return True
-        else:
-            print(f"Excluding instruction: {example['instruction']}")  # Debugging output for excluded instructions
-            return False
+    def filter_func(original_example, clean_instructions):
+        instruction = original_example["instruction"]
+        instruction = instruction.replace(" ", "").lower()  # Normalize the instruction for better matching
+        instruction = re.sub(r'[^a-zA-Z ]', '', instruction)  # Remove non-alphabetic characters
+        
+        for clean_instr in clean_instructions:
+            if instruction in clean_instr:
+                return True
+            
+            if clean_instr in instruction:
+                return True
+
+        return False
+
 
     # select datapoints from incoming dataset which "instruction" field matches the "instruction" field in the cleaned alpaca
-    clean_instructions = set(clean_alpaca["instruction"])
-    clean_instructions = set(instr.lower().strip() for instr in clean_instructions)  # Normalize instructions for matching
+    clean_instructions = clean_alpaca["instruction"]
+    # clean_instructions = [instr.strip().lower().replace(" ", "") for instr in clean_instructions]  # Use a set for O(1) lookups and strip whitespace
+    # clean_instructions = [re.sub(r'[^a-zA-Z ]', '', instr) for instr in clean_instructions]
+    
+    # normalize original
+    cleaned_dataset = dataset['instruction']
+    # cleaned_dataset = [instr.strip().lower().replace(" ", "") for instr in cleaned_dataset]
+    # cleaned_dataset = [re.sub(r'[^a-zA-Z ]', '', instr) for instr in cleaned_dataset]
+    
+    intersection = set(clean_instructions).intersection(set(cleaned_dataset))
+    
     filtered_dataset = dataset.filter(lambda x: filter_func(x, clean_instructions), desc="Filtering with cleaned Alpaca instructions")
     return filtered_dataset
     
@@ -257,7 +274,6 @@ def get_alpaca(nsamples=128, seed=0, seqlen=2048, model="", tokenizer=None, mode
         return {"prompt_text": prompt_text, "full_text": full_text}
 
     dataset = datasets.load_dataset("tatsu-lab/alpaca", split="train")
-    dataset = intersect_with_cleaned_alpaca(dataset)  # Filter the dataset to only include instructions present in the cleaned Alpaca dataset
     dataset = dataset.shuffle(seed=seed)
     if nsamples != "full":
         dataset = dataset.select(range(nsamples))
@@ -309,7 +325,6 @@ def get_alpaca_llama31(nsamples=128, seed=0, seqlen=2048, tokenizer=None, bs=4, 
         tokenizer.pad_token = tokenizer.eos_token
     
     raw_ds = datasets.load_dataset("ernlavr/Alpaca-Llama3.1-KD", split="train").shuffle(seed=seed)
-    raw_ds = intersect_with_cleaned_alpaca(raw_ds)  # Filter the dataset to only include instructions present in the cleaned Alpaca dataset
     
     raw_ds = raw_ds.filter(
         lambda x: x['retry_count'] < num_paraphrases_trainset,

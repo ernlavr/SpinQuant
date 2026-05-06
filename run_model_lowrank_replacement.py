@@ -82,12 +82,12 @@ def memory_cleanup():
     print(f"After  — reserved: {torch.cuda.memory_reserved() / 1024**2:.1f} MB")
 
 def get_models_data_tokenizer(model_args, training_args, ptq_args):
-    print(f"Loading student model from {model_args.input_model}...")
-    model_name = "svd_qwen" if "qwen" in model_args.input_model.lower() else "svd_llama"
+    print(f"Loading student model from {ptq_args.input_model}...")
+    model_name = "svd_qwen" if "qwen" in ptq_args.input_model.lower() else "svd_llama"
     
     # tokenizer, data loader
     tokenizer = AutoTokenizer.from_pretrained(
-            pretrained_model_name_or_path=model_args.input_model,
+            pretrained_model_name_or_path=ptq_args.input_model,
             cache_dir=training_args.cache_dir,
             model_max_length=training_args.model_max_length,
             padding_side="right",
@@ -102,7 +102,6 @@ def get_models_data_tokenizer(model_args, training_args, ptq_args):
     calib_loader = data_utils.get_calib_data(ptq_args, tokenizer)
     
     student_model = None
-    student_model = model_utils.load_model(model_name, model_path=ptq_args.compressed_model)
     try:
         student_model = model_utils.load_model(model_name, model_path=ptq_args.compressed_model)
         print(f"Successfully loaded compressed model from {ptq_args.compressed_model}")
@@ -110,19 +109,16 @@ def get_models_data_tokenizer(model_args, training_args, ptq_args):
         print(f"Failed to load compressed model from {ptq_args.compressed_model}: {e}")
         print("Using HuggingFace AutoModelForCausalLM...")
         student_model = AutoModelForCausalLM.from_pretrained(
-            model_args.input_model,
+            ptq_args.input_model,
             device_map="auto" if torch.cuda.device_count() > 1 else "cuda",
             token=model_args.access_token,
             torch_dtype=torch.float32,  # Load in float32 for safety; can be converted later
         )
-    finally:
-        if student_model is not None:
-            print(f"Student model loaded with {sum(p.numel() for p in student_model.parameters()):,} parameters.")
     
-    
-    print(f"Loading teacher model from {model_args.input_model}...")
+    print(f"Student model loaded with {sum(p.numel() for p in student_model.parameters()):,} parameters.")
+    print(f"Loading teacher model from {ptq_args.input_model}...")
     teacher_model = AutoModelForCausalLM.from_pretrained(
-        model_args.input_model,
+        ptq_args.input_model,
         device_map="auto" if torch.cuda.device_count() > 1 else "cuda",
         token=model_args.access_token,
         torch_dtype=torch.float32,
@@ -259,17 +255,6 @@ def perform_binary_search_truncation(model, sensitivity_dict, calib_loader, args
     return lru.binary_search_truncation_rank(model, sensitivity_dict, calib_loader, args)
     
 def test_calib_sensitivity_ppl(model, training_args, test_loader, model_args, ptq_args):
-    tokenizer = AutoTokenizer.from_pretrained(
-            pretrained_model_name_or_path=model_args.input_model,
-            cache_dir=training_args.cache_dir,
-            model_max_length=training_args.model_max_length,
-            padding_side="right",
-            use_fast=True,
-            add_eos_token=False,
-            add_bos_token=False,
-            token=model_args.access_token,
-        )
-    
     return lru.calib_sensitivity_ppl(model, test_loader, ptq_args, use_cache=ptq_args.use_sensitivity_cache)
     
 def process():
@@ -286,8 +271,8 @@ def process():
     print(f"Compressing student with param ratio target={ptq_args.param_ratio_target}...")    
             
         
-    # uncompressed_ppl, avg_time_per_token = eval_utils.evaluator_single_gpu_simplified(student_model, test_loader, utils.DEV, ptq_args) 
-    # print(f"Uncompressed PPL before low-rank replacement: {uncompressed_ppl:.2f}")
+    uncompressed_ppl, avg_time_per_token = eval_utils.evaluator_single_gpu_simplified(student_model, test_loader, utils.DEV, ptq_args) 
+    print(f"Uncompressed PPL before low-rank replacement: {uncompressed_ppl:.2f}")
     if wandb.run is not None:
         wandb.log({
             "uncompressed/ppl": uncompressed_ppl,

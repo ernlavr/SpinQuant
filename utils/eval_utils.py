@@ -939,6 +939,32 @@ def eval_piqa(model, device, batch_size=16, num_fewshot=0, limit=None):
     print(f"  acc_norm : {acc_norm:.4f}")
     return result
 
+def eval_truthfulqa(model, device, batch_size=16, num_fewshot=0, limit=None):
+    """
+    Evaluates on TruthfulQA (817 questions, multiple-choice format testing
+    whether models avoid common misconceptions and falsehoods).
+
+    Uses the 'truthfulqa_mc2' task from lm-eval-harness, which is the standard
+    multiple-choice variant with multiple correct answers.
+
+    Key metric: acc (average probability mass on true answers)
+
+    Parameters
+    ----------
+    limit : int or float or None
+        Cap samples (int) or fraction of dataset (float). None = full dataset.
+
+    Returns
+    -------
+    dict with keys: acc, (optionally) acc_stderr
+    """
+    print("=== TruthfulQA ===")
+    result = _evaluate_task(
+        model, "truthfulqa_mc2", device, batch_size, num_fewshot=num_fewshot, limit=limit
+    )
+    acc = result.get("acc,none", result.get("acc"))
+    print(f"  acc : {acc:.4f}")
+    return result
 
 # ---------------------------------------------------------------------------
 # MathQA
@@ -976,6 +1002,7 @@ def eval_mathqa(model, device, batch_size=16, num_fewshot=0, limit=None):
 # ---------------------------------------------------------------------------
 
 BENCHMARK_FNS = {
+    "truthfulqa": eval_truthfulqa,
     "openbookqa": eval_openbookqa,
     "arc_easy":   eval_arc_easy,
     "winogrande": eval_winogrande,
@@ -1023,7 +1050,7 @@ def run_standard_benchmarks(model, tokenizer, device, batch_size=32, limit=None)
 
 BENCHMARK_SUBSET = {
     "openbookqa": eval_openbookqa,
-    # "arc_easy":   eval_arc_easy,
+    "arc_easy":   eval_arc_easy,
     "winogrande": eval_winogrande,
     "piqa":       eval_piqa,
     # "hellaswag":  eval_hellaswag,

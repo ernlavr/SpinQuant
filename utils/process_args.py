@@ -669,8 +669,7 @@ def process_args_ptq():
     ptq_args = None 
 
     ptq_args, unknown_args = parser_gen()
-    if wandb.run is not None:
-        ptq_args, unknown_args = parse_wandb_sweep(ptq_args, unknown_args)
+    
 
     parser = transformers.HfArgumentParser((ModelArguments, TrainingArguments))
     model_args, training_args = parser.parse_args_into_dataclasses(args=unknown_args)
@@ -681,6 +680,10 @@ def process_args_ptq():
     else:
         ptq_args.optimized_rotation_path = None
     ptq_args.bsz = training_args.per_device_eval_batch_size
+    ptq_args.input_model = model_args.input_model
+    
+    if wandb.run is not None:
+        ptq_args, unknown_args = parse_wandb_sweep(ptq_args, unknown_args)
     
     # parse config if WandB sweep
 
